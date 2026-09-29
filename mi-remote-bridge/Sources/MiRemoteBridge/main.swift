@@ -236,11 +236,16 @@ final class VoicePressCoordinator {
     }
 }
 
-// MARK: - HID watcher (2 Pro as keyboard, for connection status only)
+// MARK: - HID watcher (remote as keyboard, for connection status only)
 
 final class HIDWatcher {
-    static let vendorID  = 0x2717
-    static let productID = 0x32B8
+    /// Remotes whose HID connection drives the status icon.
+    static let knownRemotes: [(vendorID: Int, productID: Int)] = [
+        (0x2717, 0x32B8),  // Xiaomi Bluetooth Voice Remote 2 Pro
+        // firmware/nrf54l15-remote with its default development IDs
+        // (CONFIG_BT_DIS_PNP_VID/PID); add your production IDs here.
+        (0x1915, 0xEEEF),
+    ]
 
     var onConnect: ((String) -> Void)?
     var onDisconnect: ((String) -> Void)?
@@ -249,10 +254,13 @@ final class HIDWatcher {
 
     func start() {
         let m = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        IOHIDManagerSetDeviceMatching(m, [
-            kIOHIDVendorIDKey: Self.vendorID,
-            kIOHIDProductIDKey: Self.productID,
-        ] as CFDictionary)
+        let matching: [[String: Any]] = Self.knownRemotes.map { remote in
+            [
+                kIOHIDVendorIDKey: remote.vendorID,
+                kIOHIDProductIDKey: remote.productID,
+            ]
+        }
+        IOHIDManagerSetDeviceMatchingMultiple(m, matching as CFArray)
 
         let ctx = Unmanaged.passUnretained(self).toOpaque()
         IOHIDManagerRegisterDeviceMatchingCallback(m, HIDWatcher.deviceMatched, ctx)
