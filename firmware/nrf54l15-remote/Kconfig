@@ -34,13 +34,28 @@ config APP_ATVV_FRAME_SIZE
 	  Advertised to the host in the capabilities response. The actual
 	  notification size is also limited by the negotiated ATT MTU.
 
-config APP_KEEPALIVE_TIMEOUT_SECONDS
-	int "Stop the stream if the host sends no MIC_EXTEND for this long"
-	default 12
+config APP_AUDIO_TRANSFER_TIMEOUT_SECONDS
+	int "Audio Transfer Timeout (s)"
+	range 15 60
+	default 20
+	help
+	  Voice over BLE spec: stop the stream if the host sends no MIC_EXTEND
+	  for this long (recommended 15 s to 1 min). mi-remote-bridge sends
+	  MIC_EXTEND every 4 s, Android TV every 5-10 s.
 
 config APP_STREAM_MAX_SECONDS
-	int "Maximum length of a single voice stream"
+	int "Maximum length of a single voice stream (s)"
+	default 120
+	help
+	  Hard cap, e.g. for a stuck button while the host keeps extending.
+
+config APP_ACTIVE_REMOTE_TIMEOUT_SECONDS
+	int "Active Remote Timeout (s), 0 to disable"
 	default 60
+	help
+	  Voice over BLE spec (privacy): a host MIC_OPEN is refused unless the
+	  voice button was pressed within this time. Only affects hosts using
+	  the On-request model; Hold-to-Talk always requires a press anyway.
 
 config APP_BUTTON_DEBOUNCE_MS
 	int "Voice button debounce time (ms)"
@@ -53,6 +68,63 @@ config APP_AUDIO_THREAD_STACK_SIZE
 config APP_AUDIO_THREAD_PRIORITY
 	int "Audio thread priority"
 	default 5
+
+menu "Power"
+
+config APP_ADV_FAST_SECONDS
+	int "Fast advertising after boot, disconnect or a press (s)"
+	default 30
+
+config APP_POWEROFF
+	bool "Enter System OFF when idle and disconnected"
+	default y
+	select POWEROFF
+	help
+	  The voice button wakes the remote (it resets and reconnects, so the
+	  waking press itself is not delivered).
+
+config APP_POWEROFF_IDLE_SECONDS
+	int "Disconnected time before System OFF (s)"
+	depends on APP_POWEROFF
+	default 300
+
+endmenu
+
+menu "Battery"
+
+choice APP_BATTERY_CURVE
+	prompt "Battery voltage to percentage mapping"
+	default APP_BATTERY_CURVE_LINEAR
+
+config APP_BATTERY_CURVE_LIPO
+	bool "Single-cell LiPo (3.3-4.2 V)"
+
+config APP_BATTERY_CURVE_LINEAR
+	bool "Linear between APP_BATTERY_EMPTY_MV and APP_BATTERY_FULL_MV"
+
+endchoice
+
+config APP_BATTERY_EMPTY_MV
+	int "Voltage reported as 0 %"
+	depends on APP_BATTERY_CURVE_LINEAR
+	default 2000
+
+config APP_BATTERY_FULL_MV
+	int "Voltage reported as 100 %"
+	depends on APP_BATTERY_CURVE_LINEAR
+	default 3000
+
+config APP_BATTERY_INTERVAL_SECONDS
+	int "Battery measurement interval (s)"
+	default 600
+
+endmenu
+
+config APP_PRODUCTION_BUILD
+	bool "Production build checks"
+	help
+	  Fail the build if the Device Information PnP VID/PID are still
+	  Nordic's sample IDs.
 
 module = APP
 module-str = MiRemoteVoice remote

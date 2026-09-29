@@ -7,6 +7,10 @@
  * Threads:
  *   main  - owns the remote_sm state machine; all events arrive via app_events
  *   audio - reads the mic (or test tone), encodes and notifies audio frames
+ *
+ * Power: between presses the SoC idles in System ON sleep. While
+ * disconnected it advertises fast, then slowly, and finally enters System OFF
+ * (a few uA); the voice button wakes it with a reset.
  */
 #include <string.h>
 
@@ -17,17 +21,26 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/logging/log_ctrl.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/spinlock.h>
+#include <zephyr/sys/poweroff.h>
 
 #include "app.h"
 #include "atvv_proto.h"
 #include "atvv_service.h"
 #include "audio.h"
+#include "battery.h"
 #include "hid.h"
 #include "remote_sm.h"
 
 LOG_MODULE_REGISTER(app, CONFIG_APP_LOG_LEVEL);
+
+#if defined(CONFIG_APP_PRODUCTION_BUILD)
+BUILD_ASSERT(CONFIG_BT_DIS_PNP_VID != 0x1915 || CONFIG_BT_DIS_PNP_PID != 0xEEEF,
+	     "Production build still uses Nordic's sample USB VID/PID: set "
+	     "CONFIG_BT_DIS_PNP_VID/PID to your own IDs (see production.conf)");
+#endif
 
 /* ---- Connection tracking. ---- */
 
@@ -53,16 +66,18 @@ void app_conn_put(struct bt_conn *conn)
 /* ---- Events for the main thread. ---- */
 
 enum app_event_type {
-	EVT_BUTTON,
-	EVT_HOST_WRITE,
-	EVT_TIMEOUT,
+	EVT_BUTTON,         /* data[0] = pressed */
+	EVT_HOST_WRITE,     /* data = ATVV command */
+	EVT_AUDIO_CCC,      /* data[0] = notifications enabled */
+	EVT_TIMEOUT,        /* data[0] = enum remote_timeout */
+	EVT_INACTIVE,       /* Active Remote Timeout expired */
 	EVT_DISCONNECTED,
 };
 
 struct app_event {
 	uint8_t type;
 	uint8_t len;
-	uint8_t data[8]; /* EVT_BUTTON: data[0] = pressed; EVT_HOST_WRITE: payload */
+	uint8_t data[8];
 };
 
 K_MSGQ_DEFINE(app_events, sizeof(struct app_event), 16, 4);
@@ -74,7 +89,7 @@ static void post_event(const struct app_event *evt)
 	}
 }
 
-/* ---- Voice button (debounced GPIO). ---- */
+/* ---- Voice button (debounced GPIO) and LED. ---- */
 
 #if DT_NODE_HAS_STATUS(DT_ALIAS(voice_button), okay)
 #define BUTTON_NODE DT_ALIAS(voice_button)
@@ -135,17 +150,135 @@ static void set_led(bool on)
 	}
 }
 
-/* ---- Stream watchdogs. ---- */
+/* ---- Advertising and power policy (system workqueue). ---- */
 
-static void stream_timeout(struct k_work *work)
+#define ATVV_SERVICE_UUID                                                                          \
+	BT_UUID_128_ENCODE(ATVV_UUID_SERVICE_VAL, 0x5A21, 0x4F05, 0xBC7D, 0xAF01F617B664ULL)
+
+/* The bridge finds the remote by the ATVV UUID in the advertisement. */
+static const struct bt_data ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+	BT_DATA_BYTES(BT_DATA_GAP_APPEARANCE, (CONFIG_BT_DEVICE_APPEARANCE >> 0) & 0xff,
+		      (CONFIG_BT_DEVICE_APPEARANCE >> 8) & 0xff),
+	BT_DATA_BYTES(BT_DATA_UUID16_SOME, BT_UUID_16_ENCODE(BT_UUID_HIDS_VAL)),
+	BT_DATA_BYTES(BT_DATA_UUID128_SOME, ATVV_SERVICE_UUID),
+};
+
+static const struct bt_data sd[] = {
+	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+};
+
+static bool is_connected(void)
 {
-	post_event(&(struct app_event){.type = EVT_TIMEOUT});
+	struct bt_conn *conn = app_conn_get();
+	bool connected = conn != NULL;
+
+	app_conn_put(conn);
+	return connected;
 }
 
-/* Host must send MIC_EXTEND (the bridge does every 4 s) or the stream ends. */
-static K_WORK_DELAYABLE_DEFINE(keepalive_work, stream_timeout);
+static void advertise(bool fast)
+{
+	/* Fast: quick reconnection right after boot, disconnect or a press.
+	 * Slow: cheap background advertising until System OFF. */
+	const struct bt_le_adv_param *param =
+		fast ? BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN, BT_GAP_ADV_FAST_INT_MIN_1,
+				       BT_GAP_ADV_FAST_INT_MAX_1, NULL)
+		     : BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN, BT_GAP_ADV_SLOW_INT_MIN,
+				       BT_GAP_ADV_SLOW_INT_MAX, NULL);
+
+	(void)bt_le_adv_stop();
+	int err = bt_le_adv_start(param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+
+	if (err) {
+		LOG_ERR("advertising failed: %d", err);
+		return;
+	}
+	LOG_INF("advertising (%s)", fast ? "fast" : "slow");
+}
+
+static void adv_slow_handler(struct k_work *work)
+{
+	if (!is_connected()) {
+		advertise(false);
+	}
+}
+
+static K_WORK_DELAYABLE_DEFINE(adv_slow_work, adv_slow_handler);
+
+static void poweroff_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(poweroff_work, poweroff_handler);
+
+/* Start (or restart) the disconnected-state timeline: fast -> slow -> off. */
+static void disconnected_timeline(struct k_work *work)
+{
+	if (is_connected()) {
+		return;
+	}
+	advertise(true);
+	k_work_reschedule(&adv_slow_work, K_SECONDS(CONFIG_APP_ADV_FAST_SECONDS));
+	if (IS_ENABLED(CONFIG_APP_POWEROFF) && CONFIG_APP_POWEROFF_IDLE_SECONDS > 0) {
+		k_work_reschedule(&poweroff_work, K_SECONDS(CONFIG_APP_POWEROFF_IDLE_SECONDS));
+	}
+}
+
+static K_WORK_DEFINE(timeline_work, disconnected_timeline);
+
+static void stop_disconnected_timeline(void)
+{
+	k_work_cancel_delayable(&adv_slow_work);
+	k_work_cancel_delayable(&poweroff_work);
+}
+
+static void poweroff_handler(struct k_work *work)
+{
+#if defined(CONFIG_APP_POWEROFF)
+	if (is_connected()) {
+		return;
+	}
+	LOG_INF("idle while disconnected: entering System OFF, press the voice button to wake");
+	(void)bt_le_adv_stop();
+	audio_stop();
+	set_led(false);
+
+	/* Level-sensitive wake-up on the voice button. */
+	int err = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_LEVEL_ACTIVE);
+
+	if (err) {
+		LOG_ERR("cannot arm wake-up button (%d), staying on", err);
+		gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_BOTH);
+		return;
+	}
+	if (IS_ENABLED(CONFIG_LOG)) {
+		log_panic(); /* flush pending log output */
+	}
+	sys_poweroff();
+#endif
+}
+
+/* ---- Timers owned by the state machine glue. ---- */
+
+static void transfer_timeout(struct k_work *work)
+{
+	post_event(&(struct app_event){.type = EVT_TIMEOUT, .data = {REMOTE_TIMEOUT_TRANSFER}});
+}
+
+static void max_duration_timeout(struct k_work *work)
+{
+	post_event(&(struct app_event){.type = EVT_TIMEOUT, .data = {REMOTE_TIMEOUT_MAX}});
+}
+
+static void active_timeout(struct k_work *work)
+{
+	post_event(&(struct app_event){.type = EVT_INACTIVE});
+}
+
+/* Spec "Audio Transfer Timeout": reset by AUDIO_START and MIC_EXTEND. */
+static K_WORK_DELAYABLE_DEFINE(transfer_work, transfer_timeout);
 /* Hard cap on stream length in case the button is stuck. */
-static K_WORK_DELAYABLE_DEFINE(max_duration_work, stream_timeout);
+static K_WORK_DELAYABLE_DEFINE(max_duration_work, max_duration_timeout);
+/* Spec "Active Remote Timeout": MIC_OPEN only shortly after user activity. */
+static K_WORK_DELAYABLE_DEFINE(active_work, active_timeout);
 
 /* ---- State machine glue (runs on the main thread). ---- */
 
@@ -173,11 +306,11 @@ static void sm_hid_key(void *ctx, bool pressed)
 	app_conn_put(conn);
 }
 
-static void sm_audio_start(void *ctx, uint8_t codec)
+static void sm_audio_start(void *ctx, uint8_t codec, uint16_t frame_size)
 {
 	k_work_reschedule(&max_duration_work, K_SECONDS(CONFIG_APP_STREAM_MAX_SECONDS));
 	set_led(true);
-	audio_start(codec);
+	audio_start(codec, frame_size);
 }
 
 static void sm_audio_stop(void *ctx)
@@ -187,12 +320,20 @@ static void sm_audio_stop(void *ctx)
 	k_work_cancel_delayable(&max_duration_work);
 }
 
-static void sm_watchdog(void *ctx, bool arm)
+static void sm_transfer_timer(void *ctx, bool arm)
 {
 	if (arm) {
-		k_work_reschedule(&keepalive_work, K_SECONDS(CONFIG_APP_KEEPALIVE_TIMEOUT_SECONDS));
+		k_work_reschedule(&transfer_work,
+				  K_SECONDS(CONFIG_APP_AUDIO_TRANSFER_TIMEOUT_SECONDS));
 	} else {
-		k_work_cancel_delayable(&keepalive_work);
+		k_work_cancel_delayable(&transfer_work);
+	}
+}
+
+static void sm_user_activity(void *ctx)
+{
+	if (CONFIG_APP_ACTIVE_REMOTE_TIMEOUT_SECONDS > 0) {
+		k_work_reschedule(&active_work, K_SECONDS(CONFIG_APP_ACTIVE_REMOTE_TIMEOUT_SECONDS));
 	}
 }
 
@@ -201,8 +342,27 @@ static const struct remote_sm_ops sm_ops = {
 	.hid_key = sm_hid_key,
 	.audio_start = sm_audio_start,
 	.audio_stop = sm_audio_stop,
-	.watchdog = sm_watchdog,
+	.transfer_timer = sm_transfer_timer,
+	.user_activity = sm_user_activity,
 };
+
+/* Keep the state machine's view of the link current before each event. */
+static void refresh_link_state(void)
+{
+	struct bt_conn *conn = app_conn_get();
+
+	if (conn) {
+		uint16_t mtu = bt_gatt_get_mtu(conn);
+		uint16_t max = CONFIG_APP_ATVV_FRAME_SIZE;
+
+		if (mtu > 3 && mtu - 3 < max) {
+			max = mtu - 3;
+		}
+		remote_sm_set_max_frame_size(&sm, max);
+		remote_sm_audio_subscribed(&sm, atvv_audio_subscribed(conn));
+	}
+	app_conn_put(conn);
+}
 
 /* Bluetooth RX thread: copy the command and hand it to the main thread. */
 static void on_atvv_write(const uint8_t *data, size_t len)
@@ -214,38 +374,12 @@ static void on_atvv_write(const uint8_t *data, size_t len)
 	post_event(&evt);
 }
 
-/* ---- Advertising and connections. ---- */
-
-#define ATVV_SERVICE_UUID                                                                          \
-	BT_UUID_128_ENCODE(ATVV_UUID_SERVICE_VAL, 0x5A21, 0x4F05, 0xBC7D, 0xAF01F617B664ULL)
-
-/* The bridge finds the remote by the ATVV UUID in the advertisement. */
-static const struct bt_data ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	BT_DATA_BYTES(BT_DATA_GAP_APPEARANCE, (CONFIG_BT_DEVICE_APPEARANCE >> 0) & 0xff,
-		      (CONFIG_BT_DEVICE_APPEARANCE >> 8) & 0xff),
-	BT_DATA_BYTES(BT_DATA_UUID16_SOME, BT_UUID_16_ENCODE(BT_UUID_HIDS_VAL)),
-	BT_DATA_BYTES(BT_DATA_UUID128_SOME, ATVV_SERVICE_UUID),
-};
-
-static const struct bt_data sd[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
-};
-
-static void advertising_start(struct k_work *work)
+static void on_audio_ccc(bool enabled)
 {
-	const struct bt_le_adv_param *param = BT_LE_ADV_PARAM(
-		BT_LE_ADV_OPT_CONN, BT_GAP_ADV_FAST_INT_MIN_2, BT_GAP_ADV_FAST_INT_MAX_2, NULL);
-	int err = bt_le_adv_start(param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-
-	if (err && err != -EALREADY) {
-		LOG_ERR("advertising failed: %d", err);
-		return;
-	}
-	LOG_INF("advertising as \"%s\"", CONFIG_BT_DEVICE_NAME);
+	post_event(&(struct app_event){.type = EVT_AUDIO_CCC, .data = {enabled}});
 }
 
-static K_WORK_DEFINE(adv_work, advertising_start);
+/* ---- Connection callbacks. ---- */
 
 static void connected(struct bt_conn *conn, uint8_t err)
 {
@@ -266,10 +400,12 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	k_spin_unlock(&conn_lock, key);
 
 	LOG_INF("connected");
+	stop_disconnected_timeline();
 	hid_connected(conn);
+	battery_measure();
 
 	/* 7.5-15 ms while there is traffic; peripheral latency lets the radio
-	 * sleep through idle intervals. */
+	 * skip up to 30 idle intervals between presses. */
 	struct bt_le_conn_param param = BT_LE_CONN_PARAM_INIT(6, 12, 30, 400);
 
 	bt_conn_le_param_update(conn, &param);
@@ -293,7 +429,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
 static void recycled(void)
 {
-	k_work_submit(&adv_work);
+	k_work_submit(&timeline_work);
 }
 
 static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
@@ -311,6 +447,43 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.recycled = recycled,
 	.security_changed = security_changed,
 };
+
+static void handle_event(const struct app_event *evt)
+{
+	switch (evt->type) {
+	case EVT_BUTTON:
+		LOG_INF("voice button %s", evt->data[0] ? "down" : "up");
+		if (evt->data[0] && !is_connected()) {
+			/* Pressing while disconnected: advertise fast again and
+			 * postpone System OFF. */
+			k_work_submit(&timeline_work);
+		}
+		refresh_link_state();
+		remote_sm_button(&sm, evt->data[0]);
+		break;
+	case EVT_HOST_WRITE:
+		LOG_DBG("host cmd 0x%02x (%u bytes)", evt->data[0], evt->len);
+		refresh_link_state();
+		remote_sm_host_write(&sm, evt->data, evt->len);
+		break;
+	case EVT_AUDIO_CCC:
+		remote_sm_audio_subscribed(&sm, evt->data[0]);
+		break;
+	case EVT_TIMEOUT:
+		LOG_WRN("stream timeout (%s)",
+			evt->data[0] == REMOTE_TIMEOUT_TRANSFER ? "no MIC_EXTEND" : "max duration");
+		remote_sm_timeout(&sm, evt->data[0]);
+		break;
+	case EVT_INACTIVE:
+		remote_sm_set_active(&sm, false);
+		break;
+	case EVT_DISCONNECTED:
+		remote_sm_disconnected(&sm);
+		break;
+	default:
+		break;
+	}
+}
 
 int main(void)
 {
@@ -330,8 +503,11 @@ int main(void)
 		return 0;
 	}
 
-	remote_sm_init(&sm, &sm_ops, NULL, CONFIG_APP_ATVV_FRAME_SIZE);
-	atvv_service_init(on_atvv_write);
+	remote_sm_init(&sm, &sm_ops, NULL);
+	if (CONFIG_APP_ACTIVE_REMOTE_TIMEOUT_SECONDS == 0) {
+		remote_sm_set_active(&sm, true); /* timeout disabled */
+	}
+	atvv_service_init(on_atvv_write, on_audio_ccc);
 
 	err = hid_init();
 	if (err) {
@@ -349,32 +525,16 @@ int main(void)
 		settings_load();
 	}
 
-	k_work_submit(&adv_work);
+	/* Battery reporting is optional; keep going without it. */
+	(void)battery_init();
+
+	k_work_submit(&timeline_work);
 
 	for (;;) {
 		struct app_event evt;
 
 		k_msgq_get(&app_events, &evt, K_FOREVER);
-
-		switch (evt.type) {
-		case EVT_BUTTON:
-			LOG_INF("voice button %s", evt.data[0] ? "down" : "up");
-			remote_sm_button(&sm, evt.data[0]);
-			break;
-		case EVT_HOST_WRITE:
-			LOG_DBG("host cmd 0x%02x (%u bytes)", evt.data[0], evt.len);
-			remote_sm_host_write(&sm, evt.data, evt.len);
-			break;
-		case EVT_TIMEOUT:
-			LOG_WRN("stream timeout");
-			remote_sm_timeout(&sm);
-			break;
-		case EVT_DISCONNECTED:
-			remote_sm_disconnected(&sm);
-			break;
-		default:
-			break;
-		}
+		handle_event(&evt);
 	}
 	return 0;
 }

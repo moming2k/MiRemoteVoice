@@ -17,6 +17,7 @@ static const struct bt_uuid_128 audio_uuid = BT_UUID_INIT_128(ATVV_UUID(ATVV_UUI
 static const struct bt_uuid_128 ctl_uuid = BT_UUID_INIT_128(ATVV_UUID(ATVV_UUID_CTL_VAL));
 
 static atvv_write_cb_t write_cb;
+static atvv_audio_ccc_cb_t audio_ccc_cb;
 
 static ssize_t tx_write(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf,
 			uint16_t len, uint16_t offset, uint8_t flags)
@@ -30,9 +31,17 @@ static ssize_t tx_write(struct bt_conn *conn, const struct bt_gatt_attr *attr, c
 	return len;
 }
 
-static void ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
+static void audio_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
-	LOG_DBG("CCC %p = 0x%04x", (void *)attr, value);
+	LOG_DBG("audio CCC = 0x%04x", value);
+	if (audio_ccc_cb) {
+		audio_ccc_cb(value & BT_GATT_CCC_NOTIFY);
+	}
+}
+
+static void ctl_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+	LOG_DBG("control CCC = 0x%04x", value);
 }
 
 /*
@@ -47,19 +56,25 @@ BT_GATT_SERVICE_DEFINE(atvv_svc,
 	/* [3,4,5] AUDIO: remote -> host ADPCM */
 	BT_GATT_CHARACTERISTIC(&audio_uuid.uuid, BT_GATT_CHRC_NOTIFY, BT_GATT_PERM_NONE, NULL,
 			       NULL, NULL),
-	BT_GATT_CCC(ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE_ENCRYPT),
+	BT_GATT_CCC(audio_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE_ENCRYPT),
 	/* [6,7,8] CTL: remote -> host control events */
 	BT_GATT_CHARACTERISTIC(&ctl_uuid.uuid, BT_GATT_CHRC_NOTIFY, BT_GATT_PERM_NONE, NULL,
 			       NULL, NULL),
-	BT_GATT_CCC(ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE_ENCRYPT),
+	BT_GATT_CCC(ctl_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE_ENCRYPT),
 );
 
 #define AUDIO_ATTR (&atvv_svc.attrs[4])
 #define CTL_ATTR   (&atvv_svc.attrs[7])
 
-void atvv_service_init(atvv_write_cb_t on_write)
+void atvv_service_init(atvv_write_cb_t on_write, atvv_audio_ccc_cb_t on_audio_ccc)
 {
 	write_cb = on_write;
+	audio_ccc_cb = on_audio_ccc;
+}
+
+bool atvv_audio_subscribed(struct bt_conn *conn)
+{
+	return conn && bt_gatt_is_subscribed(conn, AUDIO_ATTR, BT_GATT_CCC_NOTIFY);
 }
 
 static int notify(struct bt_conn *conn, const struct bt_gatt_attr *attr, const uint8_t *data,

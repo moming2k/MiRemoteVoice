@@ -1,0 +1,14 @@
+/*
+ * Seeed XIAO nRF54L15 (Sense): the voice key is the USR button (alias sw0);
+ * the Sense microphone (pdm20) is already described by the board.
+ *
+ * Battery: VBAT is read on AIN7 through a 2:1 divider that is switched on
+ * by the vbat_pwr regulator (P1.15) only while measuring.
+ */
+/ {
+	zephyr,user {
+		io-channels = <&adc 7>;
+		battery-divider-ratio = <2>;
+		battery-enable = <&vbat_pwr>;
+	};
+};

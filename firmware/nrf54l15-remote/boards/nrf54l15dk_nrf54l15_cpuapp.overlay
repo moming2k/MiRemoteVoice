@@ -10,6 +10,28 @@
 	aliases {
 		voice-button = &button1;
 	};
+
+	/* Battery level = supply voltage (VDD), as on a remote running directly
+	 * from 2x AAA. On the DK this is the regulated VDD, not a battery. */
+	zephyr,user {
+		io-channels = <&adc 0>;
+	};
+};
+
+&adc {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	channel@0 {
+		reg = <0>;
+		zephyr,gain = "ADC_GAIN_1_4";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,input-positive = <NRF_SAADC_VDD>;
+		zephyr,resolution = <12>;
+		zephyr,oversampling = <8>;
+	};
 };
 
 &pinctrl {

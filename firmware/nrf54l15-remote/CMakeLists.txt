@@ -8,6 +8,8 @@ target_sources(app PRIVATE
   src/hid.c
   src/atvv_service.c
   src/audio.c
+  src/battery.c
+  src/battery_level.c
   src/remote_sm.c
   src/atvv_proto.c
   src/adpcm.c

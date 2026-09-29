@@ -37,17 +37,45 @@
 #define ATVV_CODEC_ADPCM_16K 0x02
 
 /*
- * Interaction model and reason codes. The Mac bridge only logs these, but a
- * stock Android TV host acts on them. Check the values against the Google
- * "Voice over BLE" v1.0 spec before relying on them with other hosts.
+ * Values below are from Google "Voice over BLE" spec v1.0.
  */
-#define ATVV_MODEL_HOLD_TO_TALK       0x03
+
+/* Assistant interaction models (GET_CAPS: supported set; CAPS_RESP: chosen). */
+#define ATVV_MODEL_ON_REQUEST   0x00
+#define ATVV_MODEL_PRESS_TO_TALK 0x01
+#define ATVV_MODEL_HOLD_TO_TALK 0x03
+
+/* CAPS_RESP "extra configuration". */
+#define ATVV_CAPS_EXTRA_DLE 0x01 /* ask the host to enable DLE / larger MTU */
+
+/* AUDIO_START reason. */
+#define ATVV_START_REASON_MIC_OPEN     0x00
+#define ATVV_START_REASON_PRESS_TO_TALK 0x01
 #define ATVV_START_REASON_HOLD_TO_TALK 0x03
-#define ATVV_STOP_REASON_MIC_CLOSE    0x00 /* host sent MIC_CLOSE */
-#define ATVV_STOP_REASON_RELEASED     0x02 /* voice button released */
-#define ATVV_STOP_REASON_TIMEOUT      0x03 /* no MIC_EXTEND / max duration */
-#define ATVV_STOP_REASON_DISCONNECT   0x05
-#define ATVV_MIC_OPEN_ERR_NOT_HELD    0x0F01 /* app-defined: button not held */
+
+/* AUDIO_STOP reason. */
+#define ATVV_STOP_REASON_MIC_CLOSE       0x00
+#define ATVV_STOP_REASON_HTT_RELEASED    0x02
+#define ATVV_STOP_REASON_UPCOMING_START  0x04
+#define ATVV_STOP_REASON_TRANSFER_TIMEOUT 0x08
+#define ATVV_STOP_REASON_NOTIFY_DISABLED 0x10
+#define ATVV_STOP_REASON_OTHER           0x80
+
+/* MIC_OPEN_ERROR codes. */
+#define ATVV_MIC_OPEN_ERR_NOT_ACTIVE      0x0F02 /* Active Remote Timeout expired */
+#define ATVV_MIC_OPEN_ERR_NOTIFY_DISABLED 0x0F03 /* audio notifications off */
+#define ATVV_MIC_OPEN_ERR_PTT_HTT_ACTIVE  0x0F80 /* PTT/HTT stream in progress */
+#define ATVV_MIC_OPEN_ERR_INTERNAL        0x0FFF
+
+/* Stream ids: 0x00 = opened by MIC_OPEN, 0x01..0x80 = PTT/HTT, 0xFF = any
+ * (MIC_CLOSE / MIC_EXTEND only). */
+#define ATVV_STREAM_ID_MIC_OPEN 0x00
+#define ATVV_STREAM_ID_HTT_MIN  0x01
+#define ATVV_STREAM_ID_HTT_MAX  0x80
+#define ATVV_STREAM_ID_ANY      0xFF
+
+/* Default audio frame size before CAPS negotiation. */
+#define ATVV_DEFAULT_FRAME_SIZE 20
 
 #define ATVV_CAPS_RESP_LEN    9
 #define ATVV_AUDIO_START_LEN  4
@@ -57,7 +85,8 @@
 #define ATVV_MIC_OPEN_ERR_LEN 3
 #define ATVV_CTL_MAX_LEN      9
 
-size_t atvv_build_caps_resp(uint8_t *buf, uint8_t codec, uint8_t model, uint16_t frame_size);
+size_t atvv_build_caps_resp(uint8_t *buf, uint8_t codec, uint8_t model, uint16_t frame_size,
+			    uint8_t extra_config);
 size_t atvv_build_audio_start(uint8_t *buf, uint8_t reason, uint8_t codec, uint8_t stream_id);
 size_t atvv_build_audio_sync(uint8_t *buf, uint8_t codec, uint16_t frame_num,
 			     const struct adpcm_state *state);
@@ -66,8 +95,9 @@ size_t atvv_build_start_search(uint8_t *buf);
 size_t atvv_build_mic_open_error(uint8_t *buf, uint16_t code);
 
 struct atvv_cmd {
-	uint8_t opcode;    /* one of ATVV_CMD_*, or the raw byte if unknown */
-	uint8_t stream_id; /* MIC_CLOSE / MIC_EXTEND only; 0 if absent */
+	uint8_t opcode;      /* one of ATVV_CMD_*, or the raw byte if unknown */
+	uint8_t stream_id;   /* MIC_CLOSE / MIC_EXTEND: stream id, ANY if absent */
+	uint8_t host_models; /* GET_CAPS: supported interaction models */
 	bool valid;
 };
 

@@ -13,6 +13,7 @@
 
 #include "adpcm.h"
 #include "atvv_proto.h"
+#include "battery_level.h"
 #include "remote_sm.h"
 
 static int failures;
@@ -170,7 +171,8 @@ static void test_adpcm_nibble_order(void)
 static void test_caps_resp(void)
 {
 	uint8_t b[ATVV_CTL_MAX_LEN];
-	size_t len = atvv_build_caps_resp(b, ATVV_CODEC_ADPCM_16K, ATVV_MODEL_HOLD_TO_TALK, 120);
+	size_t len = atvv_build_caps_resp(b, ATVV_CODEC_ADPCM_16K, ATVV_MODEL_HOLD_TO_TALK, 120,
+					  ATVV_CAPS_EXTRA_DLE);
 
 	CHECK(len >= 7, "caps too short for Swift parser");
 	CHECK(b[0] == 0x0B, "opcode");
@@ -180,6 +182,7 @@ static void test_caps_resp(void)
 	CHECK((b[3] & 0x03) != 0, "codec byte must carry a known codec bit");
 	CHECK(b[3] & 0x02, "selectedCodec must be ADPCM 16 kHz");
 	CHECK(((b[5] << 8) | b[6]) == 120, "frame size");
+	CHECK(b[4] == 0x03 && b[7] == 0x01 && b[8] == 0x00, "model / extra / reserved");
 }
 
 static void test_ctl_layouts(void)
@@ -215,13 +218,17 @@ static void test_parse_cmd(void)
 	struct atvv_cmd c;
 
 	c = atvv_parse_cmd(get_caps, sizeof(get_caps));
-	CHECK(c.valid && c.opcode == ATVV_CMD_GET_CAPS, "get caps");
+	CHECK(c.valid && c.opcode == ATVV_CMD_GET_CAPS && c.host_models == 0x03, "get caps");
+	c = atvv_parse_cmd(get_caps, 5); /* no models field: On-request only */
+	CHECK(c.valid && c.host_models == ATVV_MODEL_ON_REQUEST, "get caps without models");
 	c = atvv_parse_cmd(mic_open, sizeof(mic_open));
 	CHECK(c.valid && c.opcode == ATVV_CMD_MIC_OPEN, "mic open");
 	c = atvv_parse_cmd(mic_close, sizeof(mic_close));
 	CHECK(c.valid && c.opcode == ATVV_CMD_MIC_CLOSE && c.stream_id == 5, "mic close");
 	c = atvv_parse_cmd(extend, sizeof(extend));
 	CHECK(c.valid && c.opcode == ATVV_CMD_MIC_EXTEND && c.stream_id == 5, "extend");
+	c = atvv_parse_cmd((const uint8_t[]){0x0D}, 1); /* v0.4: bare opcode */
+	CHECK(c.valid && c.stream_id == ATVV_STREAM_ID_ANY, "bare mic close means any stream");
 	c = atvv_parse_cmd(NULL, 0);
 	CHECK(!c.valid, "empty");
 	c = atvv_parse_cmd((const uint8_t[]){0x42}, 1);
@@ -330,15 +337,17 @@ static void test_framer(void)
 /* ---- State machine ---- */
 
 struct sm_log {
-	char events[32][16];
+	char events[64][16];
 	int n;
 	bool audio_on;
-	bool watchdog_on;
+	uint16_t frame_size;
+	bool timer_on;
+	int activity;
 };
 
 static void log_ev(struct sm_log *l, const char *s)
 {
-	if (l->n < 32) {
+	if (l->n < 64) {
 		snprintf(l->events[l->n++], 16, "%s", s);
 	}
 }
@@ -347,7 +356,14 @@ static void t_send_ctl(void *ctx, const uint8_t *d, size_t len)
 {
 	char s[16];
 
-	snprintf(s, sizeof(s), "ctl%02X", d[0]);
+	/* Opcode plus the reason byte, or the full MIC_OPEN_ERROR code. */
+	if (d[0] == ATVV_CTL_MIC_OPEN_ERROR && len == 3) {
+		snprintf(s, sizeof(s), "0C:%02X%02X", d[1], d[2]);
+	} else if (len > 1) {
+		snprintf(s, sizeof(s), "%02X:%02X", d[0], d[1]);
+	} else {
+		snprintf(s, sizeof(s), "%02X", d[0]);
+	}
 	log_ev(ctx, s);
 }
 
@@ -356,9 +372,12 @@ static void t_hid(void *ctx, bool p)
 	log_ev(ctx, p ? "keydown" : "keyup");
 }
 
-static void t_audio_start(void *ctx, uint8_t codec)
+static void t_audio_start(void *ctx, uint8_t codec, uint16_t frame_size)
 {
-	((struct sm_log *)ctx)->audio_on = true;
+	struct sm_log *l = ctx;
+
+	l->audio_on = true;
+	l->frame_size = frame_size;
 	log_ev(ctx, "audio+");
 }
 
@@ -368,124 +387,247 @@ static void t_audio_stop(void *ctx)
 	log_ev(ctx, "audio-");
 }
 
-static void t_watchdog(void *ctx, bool arm)
+static void t_timer(void *ctx, bool arm)
 {
-	((struct sm_log *)ctx)->watchdog_on = arm;
+	((struct sm_log *)ctx)->timer_on = arm;
 }
 
-static const struct remote_sm_ops t_ops = {t_send_ctl, t_hid, t_audio_start, t_audio_stop,
-					   t_watchdog};
+static void t_activity(void *ctx)
+{
+	((struct sm_log *)ctx)->activity++;
+}
+
+static const struct remote_sm_ops t_ops = {t_send_ctl, t_hid,   t_audio_start,
+					   t_audio_stop, t_timer, t_activity};
 
 static bool expect_seq(struct sm_log *l, const char *const *seq, int n)
 {
-	if (l->n != n) {
-		return false;
+	bool ok = l->n == n;
+
+	for (int i = 0; ok && i < n; i++) {
+		ok = strcmp(l->events[i], seq[i]) == 0;
 	}
-	for (int i = 0; i < n; i++) {
-		if (strcmp(l->events[i], seq[i]) != 0) {
-			return false;
+	if (!ok) {
+		printf("    got:");
+		for (int i = 0; i < l->n; i++) {
+			printf(" %s", l->events[i]);
 		}
+		printf("\n");
 	}
-	return true;
+	return ok;
 }
 
-static void dump(struct sm_log *l)
+#define EXPECT(log, ...)                                                                           \
+	do {                                                                                       \
+		const char *const want_[] = {__VA_ARGS__};                                         \
+		CHECK(expect_seq((log), want_, (int)(sizeof(want_) / sizeof(want_[0]))),          \
+		      "unexpected event sequence");                                                \
+		(log)->n = 0;                                                                      \
+	} while (0)
+
+static const uint8_t bridge_get_caps[] = {0x0A, 0x01, 0x00, 0x00, 0x03, 0x03};
+static const uint8_t on_request_get_caps[] = {0x0A, 0x01, 0x00, 0x00, 0x03, 0x00};
+static const uint8_t mic_open[] = {0x0C, 0x00};
+
+static void sm_setup(struct remote_sm *sm, struct sm_log *log, const uint8_t *caps, size_t len)
 {
-	printf("    got:");
-	for (int i = 0; i < l->n; i++) {
-		printf(" %s", l->events[i]);
+	memset(log, 0, sizeof(*log));
+	remote_sm_init(sm, &t_ops, log);
+	remote_sm_set_max_frame_size(sm, 120);
+	remote_sm_audio_subscribed(sm, true);
+	if (caps) {
+		remote_sm_host_write(sm, caps, len);
 	}
-	printf("\n");
 }
 
-static void test_sm_hold_to_talk(void)
-{
-	struct remote_sm sm;
-	struct sm_log log = {0};
-	const uint8_t get_caps[] = {0x0A, 0x01, 0x00, 0x00, 0x03, 0x03};
-	const uint8_t mic_open[] = {0x0C, 0x00};
-
-	remote_sm_init(&sm, &t_ops, &log, 120);
-	remote_sm_host_write(&sm, get_caps, sizeof(get_caps));
-	remote_sm_button(&sm, true);
-	remote_sm_host_write(&sm, mic_open, sizeof(mic_open));
-	CHECK(log.watchdog_on, "watchdog not armed on stream start");
-	remote_sm_host_write(&sm, (const uint8_t[]){0x0E, sm.stream_id}, 2);
-	remote_sm_button(&sm, false);
-
-	/* AUDIO_STOP must precede HID key-up (main.swift relies on it). */
-	const char *const want[] = {"ctl0B", "keydown", "ctl08", "ctl04", "audio+",
-				    "audio-", "ctl00", "keyup"};
-	bool ok = expect_seq(&log, want, 8);
-
-	CHECK(ok, "hold-to-talk sequence");
-	if (!ok) {
-		dump(&log);
-	}
-	CHECK(!log.audio_on && !log.watchdog_on, "stream not fully stopped");
-}
-
-static void test_sm_short_tap_and_close(void)
+/* What mi-remote-bridge does: GET_CAPS with HTT support, then hold. */
+static void test_sm_bridge_hold_to_talk(void)
 {
 	struct remote_sm sm;
-	struct sm_log log = {0};
-	const uint8_t mic_open[] = {0x0C, 0x00};
+	struct sm_log log;
 
-	remote_sm_init(&sm, &t_ops, &log, 120);
+	sm_setup(&sm, &log, bridge_get_caps, sizeof(bridge_get_caps));
+	EXPECT(&log, "0B:01");
+	CHECK(sm.model == ATVV_MODEL_HOLD_TO_TALK, "HTT not selected");
 
-	/* Short tap: MIC_OPEN arrives after release -> error, no audio. */
+	remote_sm_button(&sm, true);
+	EXPECT(&log, "keydown", "04:03", "audio+");
+	CHECK(log.frame_size == 120, "negotiated frame size not used: %u", log.frame_size);
+	CHECK(sm.stream_id == 1 && log.timer_on, "stream id %u / timer", sm.stream_id);
+
+	/* MIC_EXTEND for this stream: no reply. The bridge's START_SEARCH
+	 * handler is never triggered because no START_SEARCH is sent. */
+	remote_sm_host_write(&sm, (const uint8_t[]){0x0E, 0x01}, 2);
+	CHECK(log.n == 0 && log.timer_on, "MIC_EXTEND must not reply");
+
+	/* MIC_OPEN during HTT: error 0x0F80, stream keeps running. */
+	remote_sm_host_write(&sm, mic_open, sizeof(mic_open));
+	EXPECT(&log, "0C:0F80");
+	CHECK(log.audio_on, "MIC_OPEN interrupted HTT stream");
+
+	/* Release: AUDIO_STOP(0x02) strictly before HID key-up. */
+	remote_sm_button(&sm, false);
+	EXPECT(&log, "audio-", "00:02", "keyup");
+	CHECK(!log.timer_on, "timer left running");
+
+	/* Stream ids auto-increment. */
+	remote_sm_button(&sm, true);
+	CHECK(sm.stream_id == 2, "stream id did not increment");
+	remote_sm_button(&sm, false);
+}
+
+static void test_sm_htt_edge_cases(void)
+{
+	struct remote_sm sm;
+	struct sm_log log;
+
+	/* Without audio notifications HTT only sends the key. */
+	sm_setup(&sm, &log, bridge_get_caps, sizeof(bridge_get_caps));
+	log.n = 0;
+	remote_sm_audio_subscribed(&sm, false);
+	remote_sm_button(&sm, true);
+	EXPECT(&log, "keydown");
+	remote_sm_button(&sm, false);
+	EXPECT(&log, "keyup");
+
+	/* Notifications disabled mid-stream -> AUDIO_STOP(0x10). */
+	remote_sm_audio_subscribed(&sm, true);
+	remote_sm_button(&sm, true);
+	log.n = 0;
+	remote_sm_audio_subscribed(&sm, false);
+	EXPECT(&log, "audio-", "00:10");
+	remote_sm_button(&sm, false);
+	EXPECT(&log, "keyup");
+
+	/* Transfer timeout -> 0x08, stuck button cap -> 0x80. */
+	remote_sm_audio_subscribed(&sm, true);
+	remote_sm_button(&sm, true);
+	log.n = 0;
+	remote_sm_timeout(&sm, REMOTE_TIMEOUT_TRANSFER);
+	EXPECT(&log, "audio-", "00:08");
+	remote_sm_button(&sm, false);
+	remote_sm_button(&sm, true);
+	log.n = 0;
+	remote_sm_timeout(&sm, REMOTE_TIMEOUT_MAX);
+	EXPECT(&log, "audio-", "00:80");
+	/* Release after the stream already ended: key-up only. */
+	remote_sm_button(&sm, false);
+	EXPECT(&log, "keyup");
+
+	/* MIC_CLOSE: wrong id ignored, 0xFF closes anything. */
+	remote_sm_button(&sm, true);
+	log.n = 0;
+	remote_sm_host_write(&sm, (const uint8_t[]){0x0D, (uint8_t)(sm.stream_id + 1)}, 2);
+	CHECK(log.n == 0 && log.audio_on, "wrong-id MIC_CLOSE acted");
+	remote_sm_host_write(&sm, (const uint8_t[]){0x0D, 0xFF}, 2);
+	EXPECT(&log, "audio-", "00:00");
+	remote_sm_button(&sm, false);
+
+	/* HTT ids stay within 0x01..0x80 and wrap. */
+	for (int i = 0; i < 300; i++) {
+		remote_sm_button(&sm, true);
+		CHECK(sm.stream_id >= 0x01 && sm.stream_id <= 0x80, "id %u", sm.stream_id);
+		remote_sm_button(&sm, false);
+	}
+}
+
+static void test_sm_on_request(void)
+{
+	struct remote_sm sm;
+	struct sm_log log;
+
+	sm_setup(&sm, &log, on_request_get_caps, sizeof(on_request_get_caps));
+	EXPECT(&log, "0B:01");
+	CHECK(sm.model == ATVV_MODEL_ON_REQUEST, "On-request not selected");
+
+	/* START_SEARCH precedes the HID key event. */
+	remote_sm_button(&sm, true);
+	EXPECT(&log, "08", "keydown");
+	remote_sm_button(&sm, false);
+	EXPECT(&log, "keyup");
+
+	/* MIC_OPEN within the Active Remote Timeout: stream id 0, reason 0. */
+	remote_sm_host_write(&sm, mic_open, sizeof(mic_open));
+	EXPECT(&log, "04:00", "audio+");
+	CHECK(sm.stream_id == 0, "on-request stream id must be 0");
+
+	/* Repeated MIC_OPEN restarts the stream. */
+	remote_sm_host_write(&sm, mic_open, sizeof(mic_open));
+	EXPECT(&log, "audio-", "00:04", "04:00", "audio+");
+
+	/* MIC_CLOSE(0x00) closes it. */
+	remote_sm_host_write(&sm, (const uint8_t[]){0x0D, 0x00}, 2);
+	EXPECT(&log, "audio-", "00:00");
+
+	/* After the Active Remote Timeout, MIC_OPEN is refused (0x0F02). */
+	remote_sm_set_active(&sm, false);
+	remote_sm_host_write(&sm, mic_open, sizeof(mic_open));
+	EXPECT(&log, "0C:0F02");
+	CHECK(!log.audio_on, "inactive remote opened the mic");
+
+	/* Without notifications: 0x0F03. */
 	remote_sm_button(&sm, true);
 	remote_sm_button(&sm, false);
+	remote_sm_audio_subscribed(&sm, false);
+	log.n = 0;
 	remote_sm_host_write(&sm, mic_open, sizeof(mic_open));
-	const char *const tap[] = {"keydown", "ctl08", "keyup", "ctl0C"};
-	bool ok = expect_seq(&log, tap, 4);
+	EXPECT(&log, "0C:0F03");
 
-	CHECK(ok, "short tap sequence");
-	if (!ok) {
-		dump(&log);
-	}
-
-	/* Host MIC_CLOSE with the wrong stream id is ignored, right id stops. */
+	/* HTT press during an on-request stream is not possible in this
+	 * model, but a host that later negotiates HTT interrupts it: 0x04. */
+	remote_sm_audio_subscribed(&sm, true);
+	remote_sm_host_write(&sm, mic_open, sizeof(mic_open));
+	remote_sm_host_write(&sm, bridge_get_caps, sizeof(bridge_get_caps));
 	log.n = 0;
 	remote_sm_button(&sm, true);
-	remote_sm_host_write(&sm, mic_open, sizeof(mic_open));
-	uint8_t id = sm.stream_id;
+	EXPECT(&log, "keydown", "audio-", "00:04", "04:03", "audio+");
+	remote_sm_button(&sm, false);
+}
 
-	CHECK(id >= 1 && id <= 0x7F, "stream id range %u", id);
-	remote_sm_host_write(&sm, (const uint8_t[]){0x0D, (uint8_t)(id + 1)}, 2);
-	CHECK(log.audio_on, "wrong-id MIC_CLOSE stopped the stream");
-	remote_sm_host_write(&sm, (const uint8_t[]){0x0D, id}, 2);
-	CHECK(!log.audio_on, "MIC_CLOSE did not stop the stream");
+static void test_sm_default_and_disconnect(void)
+{
+	struct remote_sm sm;
+	struct sm_log log;
 
-	/* Timeout while held, then disconnect releases the key silently. */
+	/* Before any GET_CAPS the remote is On-request with 20-byte frames. */
+	sm_setup(&sm, &log, NULL, 0);
+	CHECK(sm.model == ATVV_MODEL_ON_REQUEST && sm.frame_size == 20, "defaults");
+	remote_sm_button(&sm, true);
+	EXPECT(&log, "08", "keydown");
+	CHECK(log.activity == 1, "user activity not reported");
+
+	/* Disconnect: silent stop, key released, link state reset. */
+	remote_sm_host_write(&sm, bridge_get_caps, sizeof(bridge_get_caps));
 	remote_sm_host_write(&sm, mic_open, sizeof(mic_open));
-	CHECK(sm.stream_id != id, "stream id not advanced");
-	remote_sm_timeout(&sm);
-	CHECK(!log.audio_on, "timeout did not stop audio");
 	log.n = 0;
 	remote_sm_disconnected(&sm);
-	const char *const disc[] = {"keyup"};
-
-	ok = expect_seq(&log, disc, 1);
-	CHECK(ok, "disconnect should only release the key");
-	if (!ok) {
-		dump(&log);
-	}
+	EXPECT(&log, "audio-", "keyup");
+	CHECK(sm.model == ATVV_MODEL_ON_REQUEST && !sm.audio_subscribed &&
+		      sm.stream == REMOTE_STREAM_NONE,
+	      "link state not reset");
 }
 
-static void test_sm_stream_id_wraps(void)
+static void test_battery_level(void)
 {
-	struct remote_sm sm;
-	struct sm_log log = {0};
+	const struct battery_point *c = battery_curve_lipo;
+	size_t n = battery_curve_lipo_len;
+	const struct battery_point lin[] = {{3000, 100}, {2000, 0}};
 
-	remote_sm_init(&sm, &t_ops, &log, 120);
-	remote_sm_button(&sm, true);
-	for (int i = 0; i < 300; i++) {
-		log.n = 0;
-		remote_sm_host_write(&sm, (const uint8_t[]){0x0C, 0x00}, 2);
-		CHECK(sm.stream_id >= 1 && sm.stream_id <= 0x7F, "id %u out of range",
-		      sm.stream_id);
-		remote_sm_timeout(&sm);
+	CHECK(battery_level_pct(4300, c, n) == 100, "above full");
+	CHECK(battery_level_pct(4200, c, n) == 100, "full");
+	CHECK(battery_level_pct(3000, c, n) == 0, "below empty");
+	CHECK(battery_level_pct(3800, c, n) == 52, "table point");
+	CHECK(battery_level_pct(3850, c, n) == 58, "interpolated: %u", battery_level_pct(3850, c, n));
+	CHECK(battery_level_pct(2500, lin, 2) == 50, "linear midpoint");
+
+	/* Monotonic over the whole range. */
+	uint8_t prev = 0;
+
+	for (uint16_t mv = 3000; mv <= 4400; mv += 5) {
+		uint8_t p = battery_level_pct(mv, c, n);
+
+		CHECK(p >= prev, "not monotonic at %u mV", mv);
+		prev = p;
 	}
 }
 
@@ -501,10 +643,13 @@ int main(void)
 	test_parse_cmd();
 	printf("framer\n");
 	test_framer();
+	printf("battery level\n");
+	test_battery_level();
 	printf("state machine\n");
-	test_sm_hold_to_talk();
-	test_sm_short_tap_and_close();
-	test_sm_stream_id_wraps();
+	test_sm_bridge_hold_to_talk();
+	test_sm_htt_edge_cases();
+	test_sm_on_request();
+	test_sm_default_and_disconnect();
 
 	if (failures) {
 		printf("%d FAILED\n", failures);

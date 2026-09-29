@@ -1,7 +1,6 @@
 #include "audio.h"
 
 #include <string.h>
-#include <zephyr/bluetooth/gatt.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
@@ -21,13 +20,13 @@ LOG_MODULE_REGISTER(audio, CONFIG_APP_LOG_LEVEL);
 #define BLOCK_MS          10
 #define BLOCK_SAMPLES     (SAMPLE_RATE * BLOCK_MS / 1000)
 #define BLOCK_BYTES       (BLOCK_SAMPLES * sizeof(int16_t))
-#define ATT_NOTIFY_HEADER 3
 
 static K_SEM_DEFINE(start_sem, 0, 1);
 /* Incremented by every audio_start(); the thread ends a stream as soon as
  * the generation it is serving is no longer current or active is cleared. */
 static atomic_t generation;
 static atomic_t active;
+static atomic_t stream_frame_size;
 
 static struct atvv_framer framer;
 
@@ -175,22 +174,6 @@ static int source_read(int16_t *out)
 
 /* ---- Thread. ---- */
 
-static uint16_t negotiated_frame_size(void)
-{
-	struct bt_conn *conn = app_conn_get();
-	uint16_t size = CONFIG_APP_ATVV_FRAME_SIZE;
-
-	if (conn) {
-		uint16_t mtu = bt_gatt_get_mtu(conn);
-
-		if (mtu > ATT_NOTIFY_HEADER) {
-			size = MIN(size, mtu - ATT_NOTIFY_HEADER);
-		}
-	}
-	app_conn_put(conn);
-	return size;
-}
-
 static void audio_thread(void *p1, void *p2, void *p3)
 {
 	static int16_t pcm[BLOCK_SAMPLES];
@@ -204,7 +187,7 @@ static void audio_thread(void *p1, void *p2, void *p3)
 			continue;
 		}
 
-		uint16_t frame_size = negotiated_frame_size();
+		uint16_t frame_size = (uint16_t)atomic_get(&stream_frame_size);
 
 		atvv_framer_start(&framer, ATVV_CODEC_ADPCM_16K, frame_size);
 
@@ -246,9 +229,10 @@ int audio_init(void)
 	return source_init();
 }
 
-void audio_start(uint8_t codec)
+void audio_start(uint8_t codec, uint16_t frame_size)
 {
 	ARG_UNUSED(codec); /* only ADPCM 16 kHz is advertised */
+	atomic_set(&stream_frame_size, frame_size);
 	atomic_inc(&generation);
 	atomic_set(&active, 1);
 	k_sem_give(&start_sem);

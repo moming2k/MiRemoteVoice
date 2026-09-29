@@ -8,7 +8,8 @@ static void put_be16(uint8_t *buf, uint16_t value)
 	buf[1] = (uint8_t)(value & 0xFF);
 }
 
-size_t atvv_build_caps_resp(uint8_t *buf, uint8_t codec, uint8_t model, uint16_t frame_size)
+size_t atvv_build_caps_resp(uint8_t *buf, uint8_t codec, uint8_t model, uint16_t frame_size,
+			    uint8_t extra_config)
 {
 	/* 0B | version 1.0 | codecs | interaction model | frame size | extra | rfu */
 	buf[0] = ATVV_CTL_GET_CAPS_RESP;
@@ -17,7 +18,7 @@ size_t atvv_build_caps_resp(uint8_t *buf, uint8_t codec, uint8_t model, uint16_t
 	buf[3] = codec;
 	buf[4] = model;
 	put_be16(&buf[5], frame_size);
-	buf[7] = 0x00;
+	buf[7] = extra_config;
 	buf[8] = 0x00;
 	return ATVV_CAPS_RESP_LEN;
 }
@@ -73,13 +74,19 @@ struct atvv_cmd atvv_parse_cmd(const uint8_t *data, size_t len)
 	cmd.opcode = data[0];
 	switch (cmd.opcode) {
 	case ATVV_CMD_GET_CAPS:
+		/* version(2) | legacy 0x0003(2) | supported interaction models(1).
+		 * Hosts that omit the models field only support On-request. */
+		cmd.host_models = len > 5 ? data[5] : ATVV_MODEL_ON_REQUEST;
+		cmd.valid = true;
+		break;
 	case ATVV_CMD_MIC_OPEN:
 		cmd.valid = true;
 		break;
 	case ATVV_CMD_MIC_CLOSE:
 	case ATVV_CMD_MIC_EXTEND:
-		/* v1.0 carries the stream id; v0.4 hosts send the bare opcode. */
-		cmd.stream_id = len > 1 ? data[1] : 0;
+		/* v1.0 carries the stream id; v0.4 hosts send the bare opcode,
+		 * which can only mean the current stream. */
+		cmd.stream_id = len > 1 ? data[1] : ATVV_STREAM_ID_ANY;
 		cmd.valid = true;
 		break;
 	default:
