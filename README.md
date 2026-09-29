@@ -139,6 +139,7 @@ sudo ./mi-remote-voice-driver-poc/install-poc.sh
 
 - `mi-remote-bridge/`：Swift 菜单栏应用、BLE/ATVV 解码和音频路由。
 - `mi-remote-voice-driver-poc/`：生成 `MiRemoteV 2ch` HAL 驱动的验证构建及安装脚本。
+- `firmware/nrf54l15-remote/`：基于 nRF54L15 的自制语音遥控器固件（实验性，尚未在硬件上验证），见其 README。
 
 ## 许可证
 

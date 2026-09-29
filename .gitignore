@@ -9,3 +9,6 @@ DEL/
 *.wav
 *.raw.bin
 *.pcm
+
+# Host unit test binary
+firmware/**/tests/host/test_runner

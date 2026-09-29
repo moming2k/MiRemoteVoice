@@ -1,0 +1,63 @@
+menu "MiRemoteVoice remote"
+
+choice APP_AUDIO_SOURCE
+	prompt "Audio source"
+	default APP_AUDIO_SOURCE_TONE
+
+config APP_AUDIO_SOURCE_TONE
+	bool "1 kHz test tone"
+	help
+	  Stream a generated tone instead of the microphone. Useful for
+	  checking the Bluetooth and ADPCM path on a board without a mic.
+
+config APP_AUDIO_SOURCE_DMIC
+	bool "PDM microphone (pdm20)"
+	select AUDIO
+	select AUDIO_DMIC
+
+endchoice
+
+config APP_MIC_GAIN_SHIFT
+	int "Digital gain applied to microphone samples (left shift)"
+	depends on APP_AUDIO_SOURCE_DMIC
+	range 0 4
+	default 0
+	help
+	  Note that mi-remote-bridge already amplifies remote audio by
+	  +20 dB, so a loud microphone clips without any extra gain here.
+
+config APP_ATVV_FRAME_SIZE
+	int "ADPCM bytes per audio notification"
+	range 20 244
+	default 120
+	help
+	  Advertised to the host in the capabilities response. The actual
+	  notification size is also limited by the negotiated ATT MTU.
+
+config APP_KEEPALIVE_TIMEOUT_SECONDS
+	int "Stop the stream if the host sends no MIC_EXTEND for this long"
+	default 12
+
+config APP_STREAM_MAX_SECONDS
+	int "Maximum length of a single voice stream"
+	default 60
+
+config APP_BUTTON_DEBOUNCE_MS
+	int "Voice button debounce time (ms)"
+	default 15
+
+config APP_AUDIO_THREAD_STACK_SIZE
+	int "Audio thread stack size"
+	default 2048
+
+config APP_AUDIO_THREAD_PRIORITY
+	int "Audio thread priority"
+	default 5
+
+module = APP
+module-str = MiRemoteVoice remote
+source "subsys/logging/Kconfig.template.log_config"
+
+endmenu
+
+source "Kconfig.zephyr"

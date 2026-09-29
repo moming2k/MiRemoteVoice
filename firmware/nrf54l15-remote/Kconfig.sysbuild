@@ -1,0 +1,5 @@
+# Single-image application: no MCUboot or partition manager for now.
+config PARTITION_MANAGER
+	default n
+
+source "share/sysbuild/Kconfig"
