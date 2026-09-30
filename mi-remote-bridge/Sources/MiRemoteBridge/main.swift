@@ -98,6 +98,9 @@ final class VoicePressCoordinator {
     // tail left to wait for here. Keeping this delay near zero makes Doubao
     // leave its recording UI as soon as the user releases the button.
     private let tailDrainDelay: TimeInterval = 0.02
+    // Upper bound for waiting on queued remote audio at release (AudioPipe
+    // keeps at most 2 s queued).
+    private let maxQueueDrainDelay: TimeInterval = 2.5
     private var mode: Mode = .idle
     private var holdWorkItem: DispatchWorkItem?
     private var tailWorkItem: DispatchWorkItem?
@@ -139,11 +142,16 @@ final class VoicePressCoordinator {
             Key.optionTap()
         case .holding:
             mode = .idle
-            suppressNewPressUntil = Date().addingTimeInterval(
-                tailDrainDelay + 0.10
+            // Remote audio may still be queued for the MiRemoteV device, e.g.
+            // when a remote that recorded while reconnecting sends its backlog
+            // in a burst. Keep Doubao recording until it has been played.
+            let delay = min(
+                max(tailDrainDelay, AudioPipe.shared.queuedDuration),
+                maxQueueDrainDelay
             )
-            print("[PRESS] LONG release → finish immediately")
-            scheduleLongFinish()
+            suppressNewPressUntil = Date().addingTimeInterval(delay + 0.10)
+            print(String(format: "[PRESS] LONG release → finish in %.0f ms", delay * 1000))
+            scheduleLongFinish(after: delay)
         }
     }
 
@@ -188,7 +196,7 @@ final class VoicePressCoordinator {
         Key.optionDown()
     }
 
-    private func scheduleLongFinish() {
+    private func scheduleLongFinish(after delay: TimeInterval) {
         guard optionIsHeld else {
             setRemoteRouted(false)
             return
@@ -200,7 +208,7 @@ final class VoicePressCoordinator {
         }
         tailWorkItem = work
         DispatchQueue.main.asyncAfter(
-            deadline: .now() + tailDrainDelay,
+            deadline: .now() + delay,
             execute: work
         )
     }

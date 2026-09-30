@@ -237,6 +237,13 @@ final class AudioPipe: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         return remoteActive
     }
 
+    /// Seconds of audio queued for the MiRemoteV device but not yet played.
+    var queuedDuration: TimeInterval {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return Double(pendingOutput.count - pendingOutputIndex) / Self.outputSampleRate
+    }
+
     private func schedule(
         monoSamples: [Float],
         sampleRate: Double,
