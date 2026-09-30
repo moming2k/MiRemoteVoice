@@ -1,6 +1,7 @@
 #include "audio.h"
 
 #include <string.h>
+#include <zephyr/bluetooth/gatt.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
@@ -21,13 +22,6 @@ LOG_MODULE_REGISTER(audio, CONFIG_APP_LOG_LEVEL);
 #define BLOCK_SAMPLES     (SAMPLE_RATE * BLOCK_MS / 1000)
 #define BLOCK_BYTES       (BLOCK_SAMPLES * sizeof(int16_t))
 
-static K_SEM_DEFINE(start_sem, 0, 1);
-/* Incremented by every audio_start(); the thread ends a stream as soon as
- * the generation it is serving is no longer current or active is cleared. */
-static atomic_t generation;
-static atomic_t active;
-static atomic_t stream_frame_size;
-
 static struct atvv_framer framer;
 
 /* ---- Framer output: runs on the audio thread. ---- */
@@ -35,8 +29,17 @@ static struct atvv_framer framer;
 static int send_audio(void *ctx, const uint8_t *data, size_t len)
 {
 	struct bt_conn *conn = app_conn_get();
-	int err = atvv_notify_audio(conn, data, len);
+	int err = conn ? 0 : -ENOTCONN;
 
+	if (conn) {
+		/* Backlog frames were cut before the MTU was known: split them if
+		 * the link carries less (the host decodes a continuous stream). */
+		size_t max = bt_gatt_get_mtu(conn) - 3;
+
+		for (size_t off = 0; off < len && !err; off += max) {
+			err = atvv_notify_audio(conn, &data[off], MIN(max, len - off));
+		}
+	}
 	app_conn_put(conn);
 	return err;
 }
@@ -174,32 +177,153 @@ static int source_read(int16_t *out)
 
 /* ---- Thread. ---- */
 
+enum audio_cmd_type {
+	CMD_START,     /* live stream */
+	CMD_PREBUFFER, /* record into the backlog */
+	CMD_FREEZE,    /* stop recording, keep the backlog */
+	CMD_RELEASE,   /* after a delay, send the backlog (then live) */
+	CMD_STOP,
+};
+
+struct audio_cmd {
+	uint8_t type;
+	uint16_t frame_size;
+	uint32_t delay_ms;
+};
+
+K_MSGQ_DEFINE(audio_cmds, sizeof(struct audio_cmd), 8, 4);
+
+#if defined(CONFIG_APP_WAKE_CAPTURE)
+#define BACKLOG_FRAMES                                                                             \
+	(CONFIG_APP_WAKE_BUFFER_MS * 8 / CONFIG_APP_ATVV_FRAME_SIZE + 1)
+static uint8_t backlog_mem[BACKLOG_FRAMES * ATVV_BACKLOG_SLOT_SIZE(CONFIG_APP_ATVV_FRAME_SIZE)];
+#endif
+
+static audio_backlog_sent_cb_t backlog_sent_cb;
+/* ADPCM bytes in the backlog, readable from any thread (8 bytes per ms). */
+static atomic_t backlog_bytes;
+
+/* Thread-owned state. */
+static bool recording;
+static int64_t release_at; /* 0 = no release pending */
+
+static void end_recording(void)
+{
+	if (recording) {
+		source_stop();
+		recording = false;
+	}
+}
+
+static void log_stats(const char *what)
+{
+	LOG_INF("%s: %u frames sent, %u dropped, %u backlog frames dropped", what,
+		framer.frames_sent, framer.frames_dropped, framer.backlog_dropped);
+}
+
+static void begin_recording(uint16_t frame_size, bool hold)
+{
+	end_recording();
+	release_at = 0;
+	atvv_framer_start(&framer, ATVV_CODEC_ADPCM_16K, frame_size);
+#if defined(CONFIG_APP_WAKE_CAPTURE)
+	if (hold) {
+		atvv_framer_hold(&framer, backlog_mem, sizeof(backlog_mem));
+	}
+#endif
+	atomic_set(&backlog_bytes, 0);
+
+	int err = source_start();
+
+	if (err) {
+		LOG_ERR("audio source start failed: %d", err);
+		return;
+	}
+	recording = true;
+	LOG_INF("%s, %u-byte frames", hold ? "recording into backlog" : "stream started",
+		frame_size);
+}
+
+static void handle_cmd(const struct audio_cmd *cmd)
+{
+	switch (cmd->type) {
+	case CMD_START:
+		begin_recording(cmd->frame_size, false);
+		break;
+	case CMD_PREBUFFER:
+		begin_recording(CONFIG_APP_ATVV_FRAME_SIZE, true);
+		break;
+	case CMD_FREEZE:
+		if (recording && framer.holding) {
+			end_recording();
+			atvv_framer_flush_partial(&framer);
+			atomic_set(&backlog_bytes, atvv_framer_backlog_bytes(&framer));
+		}
+		break;
+	case CMD_RELEASE:
+		release_at = k_uptime_get() + cmd->delay_ms;
+		if (release_at == 0) {
+			release_at = 1;
+		}
+		break;
+	case CMD_STOP:
+		if (recording || framer.holding || release_at) {
+			end_recording();
+			log_stats("stream stopped");
+		}
+		framer.holding = false;
+		framer.count = 0;
+		release_at = 0;
+		atomic_set(&backlog_bytes, 0);
+		break;
+	default:
+		break;
+	}
+}
+
+static void release_backlog(void)
+{
+	size_t bytes = atvv_framer_backlog_bytes(&framer);
+
+	release_at = 0;
+	atvv_framer_release(&framer);
+	atomic_set(&backlog_bytes, 0);
+	LOG_INF("backlog sent: %u ms of audio", (unsigned int)(bytes / 8));
+
+	if (!recording) {
+		log_stats("replay finished");
+	}
+	if (backlog_sent_cb) {
+		backlog_sent_cb(recording);
+	}
+}
+
 static void audio_thread(void *p1, void *p2, void *p3)
 {
 	static int16_t pcm[BLOCK_SAMPLES];
 
 	for (;;) {
-		k_sem_take(&start_sem, K_FOREVER);
+		struct audio_cmd cmd;
+		k_timeout_t wait;
 
-		atomic_val_t gen = atomic_get(&generation);
+		if (recording) {
+			wait = K_NO_WAIT;
+		} else if (release_at) {
+			wait = K_TIMEOUT_ABS_MS(release_at);
+		} else {
+			wait = K_FOREVER;
+		}
 
-		if (!atomic_get(&active)) {
+		if (k_msgq_get(&audio_cmds, &cmd, wait) == 0) {
+			handle_cmd(&cmd);
 			continue;
 		}
 
-		uint16_t frame_size = (uint16_t)atomic_get(&stream_frame_size);
-
-		atvv_framer_start(&framer, ATVV_CODEC_ADPCM_16K, frame_size);
-
-		int err = source_start();
-
-		if (err) {
-			LOG_ERR("audio source start failed: %d", err);
-			continue;
+		if (release_at && k_uptime_get() >= release_at) {
+			release_backlog();
 		}
-		LOG_INF("stream started, %u-byte frames", frame_size);
 
-		while (atomic_get(&active) && atomic_get(&generation) == gen) {
+		if (recording) {
 			int n = source_read(pcm);
 
 			if (n < 0) {
@@ -207,15 +331,9 @@ static void audio_thread(void *p1, void *p2, void *p3)
 				continue;
 			}
 			atvv_framer_push(&framer, pcm, (size_t)n);
-		}
-
-		source_stop();
-		LOG_INF("stream stopped: %u frames sent, %u dropped", framer.frames_sent,
-			framer.frames_dropped);
-
-		/* A new stream may have been requested while this one ran. */
-		if (atomic_get(&active)) {
-			k_sem_give(&start_sem);
+			if (framer.holding) {
+				atomic_set(&backlog_bytes, atvv_framer_backlog_bytes(&framer));
+			}
 		}
 	}
 }
@@ -223,8 +341,16 @@ static void audio_thread(void *p1, void *p2, void *p3)
 K_THREAD_DEFINE(audio_tid, CONFIG_APP_AUDIO_THREAD_STACK_SIZE, audio_thread, NULL, NULL, NULL,
 		CONFIG_APP_AUDIO_THREAD_PRIORITY, 0, 0);
 
-int audio_init(void)
+static void send_cmd(const struct audio_cmd *cmd)
 {
+	if (k_msgq_put(&audio_cmds, cmd, K_NO_WAIT)) {
+		LOG_ERR("audio command queue full, dropped %u", cmd->type);
+	}
+}
+
+int audio_init(audio_backlog_sent_cb_t on_backlog_sent)
+{
+	backlog_sent_cb = on_backlog_sent;
 	atvv_framer_init(&framer, &framer_ops, NULL);
 	return source_init();
 }
@@ -232,13 +358,30 @@ int audio_init(void)
 void audio_start(uint8_t codec, uint16_t frame_size)
 {
 	ARG_UNUSED(codec); /* only ADPCM 16 kHz is advertised */
-	atomic_set(&stream_frame_size, frame_size);
-	atomic_inc(&generation);
-	atomic_set(&active, 1);
-	k_sem_give(&start_sem);
+	send_cmd(&(struct audio_cmd){.type = CMD_START, .frame_size = frame_size});
 }
 
 void audio_stop(void)
 {
-	atomic_set(&active, 0);
+	send_cmd(&(struct audio_cmd){.type = CMD_STOP});
+}
+
+void audio_prebuffer_start(void)
+{
+	send_cmd(&(struct audio_cmd){.type = CMD_PREBUFFER});
+}
+
+void audio_prebuffer_freeze(void)
+{
+	send_cmd(&(struct audio_cmd){.type = CMD_FREEZE});
+}
+
+void audio_prebuffer_release(uint32_t delay_ms)
+{
+	send_cmd(&(struct audio_cmd){.type = CMD_RELEASE, .delay_ms = delay_ms});
+}
+
+uint32_t audio_backlog_ms(void)
+{
+	return (uint32_t)atomic_get(&backlog_bytes) / 8;
 }

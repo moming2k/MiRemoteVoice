@@ -131,9 +131,17 @@ struct atvv_framer {
 	bool have_odd;
 	int16_t odd_sample;
 	uint8_t buf[ATVV_FRAME_MAX];
+	/* Backlog ring used while holding (see atvv_framer_hold). */
+	bool holding;
+	uint8_t *backlog;
+	size_t slot_size;
+	size_t slots;
+	size_t head;  /* oldest stored frame */
+	size_t count; /* stored frames */
 	/* Statistics. */
 	uint32_t frames_sent;
 	uint32_t frames_dropped;
+	uint32_t backlog_dropped;
 };
 
 void atvv_framer_init(struct atvv_framer *f, const struct atvv_framer_ops *ops, void *ctx);
@@ -144,5 +152,18 @@ void atvv_framer_init(struct atvv_framer *f, const struct atvv_framer_ops *ops, 
  */
 void atvv_framer_start(struct atvv_framer *f, uint8_t codec, uint16_t frame_size);
 void atvv_framer_push(struct atvv_framer *f, const int16_t *samples, size_t count);
+
+/*
+ * Holding: complete frames are kept in a ring in `mem` instead of being sent,
+ * e.g. while the remote is still reconnecting. When the ring is full the
+ * oldest frame is dropped. Call after atvv_framer_start().
+ */
+#define ATVV_BACKLOG_SLOT_SIZE(frame_size) (8 + (size_t)(frame_size))
+void atvv_framer_hold(struct atvv_framer *f, void *mem, size_t mem_size);
+/* Emit the current partial frame (a trailing odd sample is dropped). */
+void atvv_framer_flush_partial(struct atvv_framer *f);
+/* Send the backlog (preceded by AUDIO_SYNC) and continue live. */
+void atvv_framer_release(struct atvv_framer *f);
+size_t atvv_framer_backlog_bytes(const struct atvv_framer *f);
 
 #endif /* ATVV_PROTO_H_ */

@@ -50,6 +50,7 @@ struct remote_sm {
 	uint16_t max_frame_size; /* upper bound from config / MTU */
 	uint16_t frame_size;     /* negotiated in CAPS_RESP */
 	uint8_t model;           /* ATVV_MODEL_* in use */
+	bool caps_received;      /* GET_CAPS seen on this connection */
 	bool button_held;
 	bool audio_subscribed;
 	bool remote_active; /* within the Active Remote Timeout */

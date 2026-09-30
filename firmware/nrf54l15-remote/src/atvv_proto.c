@@ -119,19 +119,24 @@ void atvv_framer_start(struct atvv_framer *f, uint8_t codec, uint16_t frame_size
 	f->frame_num = 0;
 	f->resync_pending = true;
 	f->have_odd = false;
+	f->holding = false;
+	f->count = 0;
 	f->frames_sent = 0;
 	f->frames_dropped = 0;
+	f->backlog_dropped = 0;
 }
 
-static void framer_emit(struct atvv_framer *f)
+/* Send one frame; `start`/`num` describe it for a possible AUDIO_SYNC. */
+static void framer_send(struct atvv_framer *f, const uint8_t *data, size_t len,
+			const struct adpcm_state *start, uint16_t num)
 {
 	bool send = true;
 
 	if (f->resync_pending) {
 		uint8_t sync[ATVV_AUDIO_SYNC_LEN];
-		size_t len = atvv_build_audio_sync(sync, f->codec, f->frame_num, &f->frame_start);
+		size_t sync_len = atvv_build_audio_sync(sync, f->codec, num, start);
 
-		if (f->ops->send_ctl(f->ctx, sync, len) == 0) {
+		if (f->ops->send_ctl(f->ctx, sync, sync_len) == 0) {
 			f->resync_pending = false;
 		} else {
 			/* The host would decode this frame with stale state: drop it
@@ -140,13 +145,49 @@ static void framer_emit(struct atvv_framer *f)
 		}
 	}
 
-	if (send && f->ops->send_audio(f->ctx, f->buf, f->fill) == 0) {
+	if (send && f->ops->send_audio(f->ctx, data, len) == 0) {
 		f->frames_sent++;
 	} else {
 		f->frames_dropped++;
 		f->resync_pending = true;
 	}
+}
 
+/* Backlog slot layout: predictor(2) step(1) pad(1) num(2) len(2) data. */
+static uint8_t *slot_at(struct atvv_framer *f, size_t index)
+{
+	return f->backlog + ((f->head + index) % f->slots) * f->slot_size;
+}
+
+static void backlog_store(struct atvv_framer *f)
+{
+	if (f->count == f->slots) {
+		/* Drop the oldest frame; the host must resync after the gap. */
+		f->head = (f->head + 1) % f->slots;
+		f->count--;
+		f->backlog_dropped++;
+		f->resync_pending = true;
+	}
+
+	uint8_t *slot = slot_at(f, f->count);
+	uint16_t len = f->fill;
+
+	memcpy(&slot[0], &f->frame_start.predictor, 2);
+	slot[2] = f->frame_start.step_index;
+	slot[3] = 0;
+	memcpy(&slot[4], &f->frame_num, 2);
+	memcpy(&slot[6], &len, 2);
+	memcpy(&slot[8], f->buf, len);
+	f->count++;
+}
+
+static void framer_emit(struct atvv_framer *f)
+{
+	if (f->holding) {
+		backlog_store(f);
+	} else {
+		framer_send(f, f->buf, f->fill, &f->frame_start, f->frame_num);
+	}
 	f->frame_num++;
 	f->fill = 0;
 }
@@ -174,4 +215,59 @@ void atvv_framer_push(struct atvv_framer *f, const int16_t *samples, size_t coun
 			framer_emit(f);
 		}
 	}
+}
+
+void atvv_framer_hold(struct atvv_framer *f, void *mem, size_t mem_size)
+{
+	f->backlog = mem;
+	f->slot_size = ATVV_BACKLOG_SLOT_SIZE(f->frame_size);
+	f->slots = mem_size / f->slot_size;
+	f->head = 0;
+	f->count = 0;
+	f->backlog_dropped = 0;
+	f->holding = f->slots > 0;
+}
+
+void atvv_framer_flush_partial(struct atvv_framer *f)
+{
+	f->have_odd = false;
+	if (f->fill > 0) {
+		framer_emit(f);
+	}
+}
+
+void atvv_framer_release(struct atvv_framer *f)
+{
+	if (!f->holding) {
+		return;
+	}
+	f->holding = false;
+
+	for (size_t i = 0; i < f->count; i++) {
+		const uint8_t *slot = slot_at(f, i);
+		struct adpcm_state start;
+		uint16_t num;
+		uint16_t len;
+
+		memcpy(&start.predictor, &slot[0], 2);
+		start.step_index = slot[2];
+		memcpy(&num, &slot[4], 2);
+		memcpy(&len, &slot[6], 2);
+		framer_send(f, &slot[8], len, &start, num);
+	}
+	f->count = 0;
+}
+
+size_t atvv_framer_backlog_bytes(const struct atvv_framer *f)
+{
+	size_t bytes = 0;
+
+	for (size_t i = 0; i < f->count; i++) {
+		const uint8_t *slot = f->backlog + ((f->head + i) % f->slots) * f->slot_size;
+		uint16_t len;
+
+		memcpy(&len, &slot[6], 2);
+		bytes += len;
+	}
+	return bytes;
 }

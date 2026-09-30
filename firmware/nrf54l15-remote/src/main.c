@@ -10,7 +10,8 @@
  *
  * Power: between presses the SoC idles in System ON sleep. While
  * disconnected it advertises fast, then slowly, and finally enters System OFF
- * (a few uA); the voice button wakes it with a reset.
+ * (a few uA); the voice button wakes it with a reset. Audio spoken while it
+ * reconnects is recorded and delivered once the host is ready (wake.h).
  */
 #include <string.h>
 
@@ -33,6 +34,7 @@
 #include "battery.h"
 #include "hid.h"
 #include "remote_sm.h"
+#include "wake.h"
 
 LOG_MODULE_REGISTER(app, CONFIG_APP_LOG_LEVEL);
 
@@ -72,6 +74,9 @@ enum app_event_type {
 	EVT_TIMEOUT,        /* data[0] = enum remote_timeout */
 	EVT_INACTIVE,       /* Active Remote Timeout expired */
 	EVT_DISCONNECTED,
+	EVT_SECURITY,       /* link encrypted */
+	EVT_WAKE_TIMEOUT,   /* host not ready in time for the wake press */
+	EVT_BACKLOG_SENT,   /* wake backlog sent (or abandoned) */
 };
 
 struct app_event {
@@ -129,6 +134,9 @@ static int button_init(void)
 	}
 	err = gpio_pin_configure_dt(&button, GPIO_INPUT);
 	if (!err) {
+		/* A press that is still down at boot is the one that woke us. */
+		button_reported = gpio_pin_get_dt(&button) > 0;
+
 		err = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_BOTH);
 	}
 	if (err) {
@@ -280,9 +288,25 @@ static K_WORK_DELAYABLE_DEFINE(max_duration_work, max_duration_timeout);
 /* Spec "Active Remote Timeout": MIC_OPEN only shortly after user activity. */
 static K_WORK_DELAYABLE_DEFINE(active_work, active_timeout);
 
+static void wake_timeout_handler(struct k_work *work)
+{
+	post_event(&(struct app_event){.type = EVT_WAKE_TIMEOUT});
+}
+
+static K_WORK_DELAYABLE_DEFINE(wake_timeout_work, wake_timeout_handler);
+
 /* ---- State machine glue (runs on the main thread). ---- */
 
 static struct remote_sm sm;
+static struct wake wake;
+/* The next AUDIO_START belongs to the wake press: send its backlog instead
+ * of starting a fresh recording. */
+static bool wake_stream_pending;
+/* The wake backlog is waiting to be sent (route delay). */
+static bool wake_backlog_inflight;
+/* The button is already up: release the delivered press once the backlog has
+ * been sent. */
+static bool wake_replaying;
 
 static void sm_send_ctl(void *ctx, const uint8_t *data, size_t len)
 {
@@ -310,11 +334,26 @@ static void sm_audio_start(void *ctx, uint8_t codec, uint16_t frame_size)
 {
 	k_work_reschedule(&max_duration_work, K_SECONDS(CONFIG_APP_STREAM_MAX_SECONDS));
 	set_led(true);
-	audio_start(codec, frame_size);
+	if (wake_stream_pending) {
+		wake_stream_pending = false;
+		/* Hold the backlog back until the bridge has classified the press
+		 * as a long press and routed the remote mic (300 ms); audio before
+		 * that would be dropped on the Mac. */
+		wake_backlog_inflight = true;
+		audio_prebuffer_release(CONFIG_APP_WAKE_ROUTE_DELAY_MS);
+	} else {
+		audio_start(codec, frame_size);
+	}
 }
 
 static void sm_audio_stop(void *ctx)
 {
+	if (wake_backlog_inflight) {
+		/* Stream ended (timeout, MIC_CLOSE...) before the backlog went
+		 * out: the audio thread will not report it, so do it here so a
+		 * replayed press still gets released. */
+		post_event(&(struct app_event){.type = EVT_BACKLOG_SENT});
+	}
 	audio_stop();
 	set_led(false);
 	k_work_cancel_delayable(&max_duration_work);
@@ -379,6 +418,91 @@ static void on_audio_ccc(bool enabled)
 	post_event(&(struct app_event){.type = EVT_AUDIO_CCC, .data = {enabled}});
 }
 
+/* Audio thread: the wake backlog has been sent. */
+static void on_backlog_sent(bool recording)
+{
+	ARG_UNUSED(recording);
+	post_event(&(struct app_event){.type = EVT_BACKLOG_SENT});
+}
+
+/* ---- Wake press (runs on the main thread). ---- */
+
+static const char *const wake_action_names[] = {
+	"none", "freeze", "restart", "deliver hold", "deliver replay", "deliver press", "discard",
+};
+
+/* Deliver the wake press to the state machine as a (replayed) press. */
+static void deliver_wake_press(bool replay)
+{
+	wake_stream_pending = true;
+	wake_replaying = replay;
+	remote_sm_button(&sm, true);
+
+	if (wake_stream_pending) {
+		/* No stream started (e.g. notifications went away): give up. */
+		wake_stream_pending = false;
+		audio_stop();
+		if (replay) {
+			wake_replaying = false;
+			remote_sm_button(&sm, false);
+		}
+	}
+}
+
+static void apply_wake_action(enum wake_action action)
+{
+	if (action == WAKE_NONE) {
+		return;
+	}
+	LOG_INF("wake press: %s (backlog %u ms)", wake_action_names[action], audio_backlog_ms());
+
+	switch (action) {
+	case WAKE_FREEZE:
+		audio_prebuffer_freeze();
+		break;
+	case WAKE_RESTART:
+		audio_prebuffer_start();
+		break;
+	case WAKE_DELIVER_HOLD:
+		deliver_wake_press(false);
+		break;
+	case WAKE_DELIVER_REPLAY:
+		deliver_wake_press(true);
+		break;
+	case WAKE_DELIVER_PRESS:
+		audio_stop();
+		remote_sm_button(&sm, true);
+		break;
+	case WAKE_DISCARD:
+		audio_stop();
+		break;
+	default:
+		break;
+	}
+
+	if (!wake_pending(&wake)) {
+		k_work_cancel_delayable(&wake_timeout_work);
+	}
+}
+
+/* Deliver the wake press once the host can take it. */
+static void check_wake_ready(void)
+{
+	if (!wake_pending(&wake)) {
+		return;
+	}
+
+	struct bt_conn *conn = app_conn_get();
+	bool ready = conn && bt_conn_get_security(conn) >= BT_SECURITY_L2 && sm.caps_received &&
+		     sm.audio_subscribed;
+
+	app_conn_put(conn);
+	if (ready) {
+		apply_wake_action(wake_ready(&wake, sm.model == ATVV_MODEL_HOLD_TO_TALK,
+					     audio_backlog_ms()));
+	}
+}
+
 /* ---- Connection callbacks. ---- */
 
 static void connected(struct bt_conn *conn, uint8_t err)
@@ -438,6 +562,7 @@ static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_
 		LOG_WRN("security failed: level %u err %d", level, err);
 	} else {
 		LOG_INF("security level %u", level);
+		post_event(&(struct app_event){.type = EVT_SECURITY});
 	}
 }
 
@@ -451,23 +576,53 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 static void handle_event(const struct app_event *evt)
 {
 	switch (evt->type) {
-	case EVT_BUTTON:
+	case EVT_BUTTON: {
+		enum wake_action action;
+
 		LOG_INF("voice button %s", evt->data[0] ? "down" : "up");
 		if (evt->data[0] && !is_connected()) {
 			/* Pressing while disconnected: advertise fast again and
 			 * postpone System OFF. */
 			k_work_submit(&timeline_work);
 		}
+		if (wake_button(&wake, evt->data[0], &action)) {
+			apply_wake_action(action);
+			break;
+		}
+		if (!evt->data[0] && wake_backlog_inflight && !wake_replaying) {
+			/* Released during the route delay: stop recording, send what
+			 * was recorded, then release (EVT_BACKLOG_SENT). */
+			audio_prebuffer_freeze();
+			wake_replaying = true;
+			break;
+		}
 		refresh_link_state();
 		remote_sm_button(&sm, evt->data[0]);
 		break;
+	}
 	case EVT_HOST_WRITE:
 		LOG_DBG("host cmd 0x%02x (%u bytes)", evt->data[0], evt->len);
 		refresh_link_state();
 		remote_sm_host_write(&sm, evt->data, evt->len);
+		check_wake_ready();
 		break;
 	case EVT_AUDIO_CCC:
 		remote_sm_audio_subscribed(&sm, evt->data[0]);
+		check_wake_ready();
+		break;
+	case EVT_SECURITY:
+		refresh_link_state();
+		check_wake_ready();
+		break;
+	case EVT_WAKE_TIMEOUT:
+		apply_wake_action(wake_timeout(&wake));
+		break;
+	case EVT_BACKLOG_SENT:
+		wake_backlog_inflight = false;
+		if (wake_replaying) {
+			wake_replaying = false;
+			remote_sm_button(&sm, false);
+		}
 		break;
 	case EVT_TIMEOUT:
 		LOG_WRN("stream timeout (%s)",
@@ -478,6 +633,9 @@ static void handle_event(const struct app_event *evt)
 		remote_sm_set_active(&sm, false);
 		break;
 	case EVT_DISCONNECTED:
+		wake_stream_pending = false;
+		wake_backlog_inflight = false;
+		wake_replaying = false;
 		remote_sm_disconnected(&sm);
 		break;
 	default:
@@ -497,10 +655,18 @@ int main(void)
 		return 0;
 	}
 
-	err = audio_init();
+	err = audio_init(on_backlog_sent);
 	if (err) {
 		LOG_ERR("audio init failed: %d", err);
 		return 0;
+	}
+
+	wake_init(&wake, IS_ENABLED(CONFIG_APP_WAKE_CAPTURE) && button_reported,
+		  CONFIG_APP_WAKE_MIN_REPLAY_MS);
+	if (wake_pending(&wake)) {
+		LOG_INF("woken by the voice button: recording until the host is ready");
+		audio_prebuffer_start();
+		k_work_reschedule(&wake_timeout_work, K_SECONDS(CONFIG_APP_WAKE_TIMEOUT_SECONDS));
 	}
 
 	remote_sm_init(&sm, &sm_ops, NULL);

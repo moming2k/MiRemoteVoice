@@ -15,6 +15,7 @@
 #include "atvv_proto.h"
 #include "battery_level.h"
 #include "remote_sm.h"
+#include "wake.h"
 
 static int failures;
 
@@ -631,6 +632,175 @@ static void test_battery_level(void)
 	}
 }
 
+
+/* Holding: frames go to the backlog; release sends them with a leading
+ * AUDIO_SYNC, then live audio continues seamlessly. */
+static void run_backlog(size_t ring_frames, size_t hold_samples, size_t live_samples,
+			uint32_t *dropped, double *snr, size_t *delivered_from)
+{
+	enum { FRAME = 120, N = 16000 * 3 };
+	static int16_t in[N];
+	static struct sim_host host;
+	static uint8_t ring[64 * ATVV_BACKLOG_SLOT_SIZE(120)];
+	struct atvv_framer f;
+
+	memset(&host, 0, sizeof(host));
+	host.fail_audio_at = -1;
+	dec_reset(&host.dec, -777, 60); /* stale host state */
+	make_signal(in, N);
+
+	atvv_framer_init(&f, &sim_ops, &host);
+	atvv_framer_start(&f, ATVV_CODEC_ADPCM_16K, FRAME);
+	atvv_framer_hold(&f, ring, ring_frames * ATVV_BACKLOG_SLOT_SIZE(FRAME));
+	CHECK(f.slots == ring_frames, "slots %zu", f.slots);
+
+	atvv_framer_push(&f, in, hold_samples);
+	CHECK(host.out_len == 0 && host.syncs == 0, "sent while holding");
+	size_t expect_bytes = (hold_samples / (FRAME * 2) < ring_frames
+				       ? hold_samples / (FRAME * 2)
+				       : ring_frames) *
+			      FRAME;
+
+	CHECK(atvv_framer_backlog_bytes(&f) == expect_bytes, "backlog bytes %zu, want %zu",
+	      atvv_framer_backlog_bytes(&f), expect_bytes);
+
+	atvv_framer_release(&f);
+	atvv_framer_push(&f, &in[hold_samples], live_samples);
+
+	*dropped = f.backlog_dropped;
+	*delivered_from = (size_t)f.backlog_dropped * FRAME * 2;
+	CHECK(host.syncs == 1, "expected exactly one AUDIO_SYNC, got %d", host.syncs);
+
+	/* Exact check: a continuous reference encoder's reconstruction is what
+	 * a correctly synchronised decoder must output, sample for sample. */
+	static int16_t recon[N];
+	struct adpcm_state ref;
+	size_t mismatches = 0;
+
+	adpcm_reset(&ref);
+	for (size_t i = 0; i < hold_samples + live_samples; i++) {
+		adpcm_encode_sample(&ref, in[i]);
+		recon[i] = ref.predictor;
+	}
+	for (size_t i = 0; i < host.out_len; i++) {
+		mismatches += host.out[i] != recon[*delivered_from + i];
+	}
+	CHECK(mismatches == 0, "%zu decoded samples differ from the encoder", mismatches);
+
+	double sig = 0, err = 0;
+
+	for (size_t i = 0; i < host.out_len; i++) {
+		int16_t r = in[*delivered_from + i];
+
+		sig += (double)r * r;
+		err += (double)(r - host.out[i]) * (r - host.out[i]);
+	}
+	*snr = 10 * log10(sig / (err + 1e-9));
+}
+
+static void test_framer_backlog(void)
+{
+	uint32_t dropped;
+	double snr;
+	size_t from;
+
+	/* Fits: 20 frames held in a 40-frame ring, then 1 s live. */
+	run_backlog(40, 20 * 240, 16000, &dropped, &snr, &from);
+	CHECK(dropped == 0, "unexpected backlog drops %u", dropped);
+	CHECK(snr > 15.0, "backlog SNR %.1f dB", snr);
+	printf("  backlog (no overflow) SNR %.1f dB\n", snr);
+
+	/* Overflow: 50 frames into a 16-frame ring keeps the newest 16. */
+	run_backlog(16, 50 * 240, 16000, &dropped, &snr, &from);
+	CHECK(dropped == 34, "expected 34 dropped frames, got %u", dropped);
+	CHECK(snr > 15.0, "backlog-after-overflow SNR %.1f dB", snr);
+	printf("  backlog (overflow) SNR %.1f dB\n", snr);
+}
+
+static void test_framer_flush_partial(void)
+{
+	static struct sim_host host;
+	static uint8_t ring[8 * ATVV_BACKLOG_SLOT_SIZE(120)];
+	struct atvv_framer f;
+	int16_t in[101];
+
+	memset(&host, 0, sizeof(host));
+	host.fail_audio_at = -1;
+	for (int i = 0; i < 101; i++) {
+		in[i] = (int16_t)(i * 50);
+	}
+	atvv_framer_init(&f, &sim_ops, &host);
+	atvv_framer_start(&f, ATVV_CODEC_ADPCM_16K, 120);
+	atvv_framer_hold(&f, ring, sizeof(ring));
+	atvv_framer_push(&f, in, 101);
+	CHECK(atvv_framer_backlog_bytes(&f) == 0, "partial frame stored early");
+	atvv_framer_flush_partial(&f);
+	CHECK(atvv_framer_backlog_bytes(&f) == 50, "partial frame bytes %zu",
+	      atvv_framer_backlog_bytes(&f));
+	atvv_framer_release(&f);
+	CHECK(host.out_len == 100, "decoded %zu samples", host.out_len);
+}
+
+static void test_wake(void)
+{
+	struct wake w;
+	enum wake_action a;
+
+	/* Not pressed at boot: nothing to do, events pass through. */
+	wake_init(&w, false, 500);
+	CHECK(!wake_pending(&w), "pending without press");
+	CHECK(!wake_button(&w, true, &a) && a == WAKE_NONE, "idle consumed a press");
+
+	/* Held until ready with HTT: deliver as a live hold. */
+	wake_init(&w, true, 500);
+	CHECK(wake_button(&w, true, &a) && a == WAKE_NONE, "repeat press");
+	CHECK(wake_ready(&w, true, 1200) == WAKE_DELIVER_HOLD, "held -> hold");
+	CHECK(!wake_pending(&w), "still pending after ready");
+	CHECK(!wake_button(&w, false, &a), "release after delivery must reach the SM");
+
+	/* Spoke and released before ready: replay. */
+	wake_init(&w, true, 500);
+	CHECK(wake_button(&w, false, &a) && a == WAKE_FREEZE, "release -> freeze");
+	CHECK(wake_ready(&w, true, 900) == WAKE_DELIVER_REPLAY, "speech -> replay");
+
+	/* Just a tap to wake: discard. */
+	wake_init(&w, true, 500);
+	wake_button(&w, false, &a);
+	CHECK(wake_ready(&w, true, 200) == WAKE_DISCARD, "tap -> discard");
+
+	/* Tap to wake, then hold while reconnecting: restart and deliver hold. */
+	wake_init(&w, true, 500);
+	wake_button(&w, false, &a);
+	CHECK(wake_button(&w, true, &a) && a == WAKE_RESTART, "second press -> restart");
+	CHECK(wake_ready(&w, true, 100) == WAKE_DELIVER_HOLD, "restarted hold");
+
+	/* Host without Hold-to-Talk. */
+	wake_init(&w, true, 500);
+	CHECK(wake_ready(&w, false, 3000) == WAKE_DELIVER_PRESS, "on-request held");
+	wake_init(&w, true, 500);
+	wake_button(&w, false, &a);
+	CHECK(wake_ready(&w, false, 3000) == WAKE_DISCARD, "on-request released");
+
+	/* Timeout. */
+	wake_init(&w, true, 500);
+	CHECK(wake_timeout(&w) == WAKE_DISCARD && !wake_pending(&w), "timeout");
+	CHECK(wake_timeout(&w) == WAKE_NONE, "second timeout");
+	CHECK(wake_ready(&w, true, 3000) == WAKE_NONE, "ready after timeout");
+}
+
+static void test_sm_caps_flag(void)
+{
+	struct remote_sm sm;
+	struct sm_log log;
+
+	sm_setup(&sm, &log, NULL, 0);
+	CHECK(!sm.caps_received, "caps flag set before GET_CAPS");
+	remote_sm_host_write(&sm, bridge_get_caps, sizeof(bridge_get_caps));
+	CHECK(sm.caps_received, "caps flag not set");
+	remote_sm_disconnected(&sm);
+	CHECK(!sm.caps_received, "caps flag survived disconnect");
+}
+
 int main(void)
 {
 	printf("adpcm matches Swift decoder\n");
@@ -643,6 +813,12 @@ int main(void)
 	test_parse_cmd();
 	printf("framer\n");
 	test_framer();
+	printf("framer backlog\n");
+	test_framer_backlog();
+	test_framer_flush_partial();
+	printf("wake press\n");
+	test_wake();
+	test_sm_caps_flag();
 	printf("battery level\n");
 	test_battery_level();
 	printf("state machine\n");

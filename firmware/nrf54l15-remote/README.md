@@ -132,12 +132,41 @@ button as its Assistant key.
 - The microphone (PDM clock) and audio thread only run while streaming.
 - While disconnected: fast advertising for 30 s, then slow (~1 s) advertising,
   then **System OFF after 5 minutes**. Pressing the voice button wakes the
-  remote; it resets and reconnects, so **the waking press itself is not
-  delivered** — press again once it has reconnected.
+  remote (see *Wake press* below).
 - `release.conf` removes logging and the UART console, which otherwise keep
   the UART receiver running. Measure current with a release build.
 - Not done: gating the XIAO Sense microphone/IMU supply (P0.01 is held on by
   the board devicetree) and trimming radio TX power.
+
+## Wake press
+
+The press that wakes the remote from System OFF resets it, so the Mac is not
+connected yet. If the button is still down when the firmware starts, the
+remote records while it reconnects (up to the newest 2 s, compressed in
+RAM) and delivers the press once the Mac is connected, encrypted, has sent
+GET_CAPS and subscribed to audio:
+
+| What the user did | What the Mac gets |
+|---|---|
+| kept holding until reconnected | a normal hold; the recorded backlog is sent first, then live audio |
+| spoke and released before reconnecting (≥ 0.4 s) | a replayed hold: press, backlog, release |
+| only tapped to wake (< 0.4 s) | nothing (the tap just wakes the remote) |
+| tapped to wake, then held while reconnecting | the new hold, as in the first row |
+| Mac not ready within 10 s | nothing; the recording is discarded |
+
+The backlog goes out 0.4 s after AUDIO_START, because the bridge only routes
+the remote microphone once the key has been held for 300 ms. It arrives in
+a burst, so it plays with a delay; **the bridge now waits for queued remote
+audio to finish playing before it ends Doubao's recording**, otherwise the
+end of the sentence would be cut off (`VoicePressCoordinator.keyUp`,
+capped at 2.5 s).
+
+Words spoken more than 2 s before the Mac is ready are lost (the bridge
+queues at most 2 s). How long reconnection takes on real hardware still has
+to be measured.
+
+Options: `CONFIG_APP_WAKE_CAPTURE`, `_BUFFER_MS` (2000), `_MIN_REPLAY_MS`
+(400), `_ROUTE_DELAY_MS` (400), `_TIMEOUT_SECONDS` (10).
 
 ## Battery level
 
@@ -200,12 +229,13 @@ src/hid.c          HID-over-GATT keyboard (NCS bt_hids)
 src/audio.c        audio thread: PDM mic or test tone -> framer
 src/battery.c      ADC battery measurement -> Battery Service
 src/battery_level.c voltage -> percentage curves
+src/wake.c         what to do with the press that woke the remote
 src/main.c         Bluetooth setup, button, events
 tests/host/        host unit tests for the portable modules
 ```
 
-`adpcm`, `atvv_proto`, `remote_sm` and `battery_level` have no Zephyr
-dependencies.
+`adpcm`, `atvv_proto`, `remote_sm`, `battery_level` and `wake` have no
+Zephyr dependencies.
 
 ## Tests
 
@@ -216,14 +246,17 @@ make -C firmware/nrf54l15-remote/tests/host
 The tests compare the encoder sample-by-sample with a C port of the bridge's
 Swift decoder, check message layouts against the Swift parser's expectations,
 simulate a dropped notification to check resync, walk the state machine
-through both interaction models and every stop/error path above, and check
-the battery curves.
+through both interaction models and every stop/error path above, check the
+wake-press decisions, check that a held-then-released backlog (including one
+that overflowed) decodes sample-for-sample like the continuous encoder, and
+check the battery curves.
 
 ## Not done yet
 
 - Hardware bring-up and current measurements.
 - Microphone/IMU supply gating on the XIAO Sense, TX power tuning.
-- Delivering the press that wakes the remote from System OFF.
+- Measuring wake-to-ready time; if it is regularly over 2 s, the bridge's
+  2 s queue limit (`AudioPipe`) would need raising for wake presses.
 - Filter-accept list / directed advertising for the bonded Mac.
 - Press-to-Talk, 8 kHz fallback, v0.4e compatibility (only matter for
   Android TV hosts).

@@ -90,6 +90,47 @@ config APP_POWEROFF_IDLE_SECONDS
 
 endmenu
 
+menu "Wake press"
+
+config APP_WAKE_CAPTURE
+	bool "Record and deliver the press that wakes the remote"
+	default y
+	help
+	  If the voice button is still down when the firmware starts (it woke
+	  from System OFF), record audio while reconnecting and deliver it
+	  once the host is ready. See src/wake.h.
+
+# The options below stay defined when APP_WAKE_CAPTURE is off so the code
+# using them still compiles.
+
+config APP_WAKE_BUFFER_MS
+	int "Backlog length (ms)"
+	range 500 5000
+	default 2000
+	help
+	  Newest audio kept while reconnecting (8 bytes of RAM per ms).
+	  mi-remote-bridge queues at most 2 s of audio, so more is not useful
+	  with it.
+
+config APP_WAKE_MIN_REPLAY_MS
+	int "Minimum recording to replay a released wake press (ms)"
+	default 400
+	help
+	  Shorter presses are treated as a tap that only wakes the remote.
+
+config APP_WAKE_ROUTE_DELAY_MS
+	int "Delay between AUDIO_START and sending the backlog (ms)"
+	default 400
+	help
+	  mi-remote-bridge routes the remote microphone only after the key has
+	  been held for 300 ms and drops audio received before that.
+
+config APP_WAKE_TIMEOUT_SECONDS
+	int "Give up if the host is not ready within (s)"
+	default 10
+
+endmenu
+
 menu "Battery"
 
 choice APP_BATTERY_CURVE

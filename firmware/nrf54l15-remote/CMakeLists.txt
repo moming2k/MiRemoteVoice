@@ -13,4 +13,5 @@ target_sources(app PRIVATE
   src/remote_sm.c
   src/atvv_proto.c
   src/adpcm.c
+  src/wake.c
 )

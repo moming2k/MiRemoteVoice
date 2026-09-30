@@ -9,6 +9,7 @@ static void reset_link_state(struct remote_sm *sm)
 		sm->frame_size = sm->max_frame_size;
 	}
 	sm->model = ATVV_MODEL_ON_REQUEST;
+	sm->caps_received = false;
 	sm->audio_subscribed = false;
 	sm->stream = REMOTE_STREAM_NONE;
 	sm->stream_id = 0;
@@ -129,6 +130,7 @@ static void handle_get_caps(struct remote_sm *sm, uint8_t host_models)
 	 * not implement Press-to-Talk). */
 	sm->model = (host_models & 0x02) ? ATVV_MODEL_HOLD_TO_TALK : ATVV_MODEL_ON_REQUEST;
 	sm->frame_size = sm->max_frame_size;
+	sm->caps_received = true;
 
 	send_ctl(sm, buf,
 		 atvv_build_caps_resp(buf, ATVV_CODEC_ADPCM_16K, sm->model, sm->frame_size,
